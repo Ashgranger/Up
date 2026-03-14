@@ -82,6 +82,7 @@ prices = PriceStore()
 
 # Active subscriptions — ws_engine re-sends these on every reconnect
 _active_tokens: set[str] = set()
+_ws_ref = None   # live websocket handle — set by ws_engine on connect
 
 # ─── Data classes ──────────────────────────────────────────────────────────────
 
@@ -241,6 +242,8 @@ async def ws_engine(stop: asyncio.Event):
                 open_timeout=10,
             ) as ws:
                 log.info("WS connected ✓")
+                global _ws_ref
+                _ws_ref = ws
 
                 # Send subscribe immediately — server closes after ~10s if nothing sent
                 sub_tokens = list(_active_tokens)
@@ -284,6 +287,8 @@ async def ws_engine(stop: asyncio.Event):
             break
         except Exception as e:
             log.warning(f"WS error: {type(e).__name__}: {e}")
+        finally:
+            _ws_ref = None
 
         if not stop.is_set():
             log.info(f"WS reconnecting in {RECONNECT_DELAY}s...")
@@ -293,8 +298,21 @@ async def ws_engine(stop: asyncio.Event):
 
 
 async def subscribe(tokens: list[str]):
-    """Register tokens so ws_engine re-subs them on reconnect."""
+    """Register tokens AND immediately send subscribe on live WS if connected."""
+    global _ws_ref
+    new = [t for t in tokens if t not in _active_tokens]
     _active_tokens.update(tokens)
+    if not new:
+        return
+    msg = json.dumps({"assets_ids": new, "type": "market", "custom_feature_enabled": True})
+    if _ws_ref is not None:
+        try:
+            await _ws_ref.send(msg)
+            log.info(f"WS subscribe sent: {len(new)} tokens")
+        except Exception as e:
+            log.warning(f"WS subscribe send failed (will retry on reconnect): {e}")
+    else:
+        log.info(f"WS subscribe queued: {len(new)} tokens (reconnecting...)")
 
 
 async def unsubscribe(tokens: list[str]):
@@ -308,6 +326,7 @@ async def unsubscribe(tokens: list[str]):
 async def fetch_market(session: aiohttp.ClientSession, ts: int) -> Optional[MarketInfo]:
     slug = slug_for(ts)
     try:
+        # Try markets endpoint first
         data = await http_get(session, f"{GAMMA_API}/markets", params={"slug": slug})
     except Exception as e:
         log.debug(f"Gamma error ({slug}): {e}")
@@ -333,7 +352,7 @@ async def fetch_market(session: aiohttp.ClientSession, ts: int) -> Optional[Mark
         if s in ("up", "yes"):    ui = i
         elif s in ("down", "no"): di = i
 
-    return MarketInfo(
+    market = MarketInfo(
         slug      = slug,
         condition = m.get("conditionId", ""),
         up_token  = tokens[ui],
@@ -341,6 +360,12 @@ async def fetch_market(session: aiohttp.ClientSession, ts: int) -> Optional[Mark
         start_ts  = ts,
         end_ts    = ts + 300,
     )
+
+    # Log key market fields for diagnostics
+    log.debug(f"  market active={m.get('active')} closed={m.get('closed')} "
+              f"enableOrderBook={m.get('enableOrderBook')} "
+              f"liquidity={m.get('liquidity','?')}")
+    return market
 
 
 async def wait_for_market(session: aiohttp.ClientSession, ts: int) -> MarketInfo:
@@ -356,18 +381,34 @@ async def wait_for_market(session: aiohttp.ClientSession, ts: int) -> MarketInfo
 # ─── REST price fallback ────────────────────────────────────────────────────────
 
 async def fetch_prices_rest(session: aiohttp.ClientSession, market: MarketInfo):
-    """Fetch book via REST and seed PriceStore — used when WS snapshot is slow."""
+    """Fetch best bid/ask via REST. Uses both /book and /price for accuracy."""
     for token, name in [(market.up_token, "UP"), (market.down_token, "DOWN")]:
         try:
+            # /book gives full depth
             data = await http_get(session, f"{CLOB_API}/book", params={"token_id": token})
             bids = data.get("bids", [])
             asks = data.get("asks", [])
             bid = float(bids[0]["price"]) if bids else 0.0
             ask = float(asks[0]["price"]) if asks else 1.0
+
+            # Filter out empty-book placeholder (0.01 bid / 0.99 ask = no real liquidity)
+            if bid <= 0.01 and ask >= 0.99:
+                # Double-check with /price endpoint
+                try:
+                    buy_data  = await http_get(session, f"{CLOB_API}/price",
+                                               params={"token_id": token, "side": "BUY"})
+                    sell_data = await http_get(session, f"{CLOB_API}/price",
+                                              params={"token_id": token, "side": "SELL"})
+                    ask = float(buy_data.get("price", ask))
+                    bid = float(sell_data.get("price", bid))
+                except Exception:
+                    pass  # stick with book values
+
             prices.set(token, bid, ask)
-            log.info(f"  REST snapshot {name}: bid={bid:.4f} ask={ask:.4f}")
+            empty = " (empty book)" if bid <= 0.01 and ask >= 0.99 else ""
+            log.info(f"  REST {name}: bid={bid:.4f} ask={ask:.4f}{empty}")
         except Exception as e:
-            log.warning(f"  REST snapshot {name} failed: {e}")
+            log.warning(f"  REST {name} failed: {e}")
 
 # ─── Fill check ────────────────────────────────────────────────────────────────
 
@@ -436,7 +477,12 @@ async def monitor(session: aiohttp.ClientSession, cycle_num: int, market: Market
         # until real liquidity appears (ask < 0.90 means real quotes exist)
         prices_stale = (up_ask >= 0.90 and dn_ask >= 0.90)
         if prices_stale and now_ts() - last_rest_poll >= 15:
-            log.info("  Prices stale (empty book) — polling REST...")
+            # After market goes LIVE with no prices — warn clearly
+            if now_ts() > market.start_ts and now_ts() - market.start_ts > 60:
+                log.warning(f"  ⚠ NO LIQUIDITY — market has been LIVE "
+                            f"{now_ts()-market.start_ts}s with no real quotes. "
+                            f"This cycle will likely end unfilled.")
+            log.info("  Prices stale — polling REST...")
             await fetch_prices_rest(session, market)
             last_rest_poll = now_ts()
             up_bid, up_ask = prices.get(market.up_token)
