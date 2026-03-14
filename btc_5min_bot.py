@@ -53,8 +53,7 @@ CLOB_API         = "https://clob.polymarket.com"
 WS_MARKET_URL    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 LIMIT_PRICE      = 0.47
-FILL_BID_MAX     = 0.45
-FILL_ASK_MAX     = 0.47
+FILL_ASK_MAX     = 0.47   # Fill assumed when ask drops to/below this
 ORDER_SIZE       = 10
 PRE_MARKET_SECS  = 240        # Subscribe + place orders 4 min before start
 CYCLE_SECS       = 300
@@ -414,15 +413,9 @@ async def wait_for_market(session: aiohttp.ClientSession, ts: int) -> MarketInfo
 
 # ─── Fill logic ────────────────────────────────────────────────────────────────
 
-# Minimum bid to be considered a real quote (filters empty-book noise like 0.01)
-MIN_REAL_BID = 0.10
-MIN_REAL_ASK = 0.10
-
 def check_fill(bid: float, ask: float) -> tuple[bool, str]:
-    # Ignore junk quotes from empty/pre-open book (bid=0.01, ask=0.99)
-    if bid >= MIN_REAL_BID and bid <= FILL_BID_MAX:
-        return True, f"bid<={FILL_BID_MAX}"
-    if ask >= MIN_REAL_ASK and ask <= FILL_ASK_MAX:
+    # Fill assumed only when ask <= FILL_ASK_MAX (someone willing to sell at/below our limit)
+    if 0 < ask <= FILL_ASK_MAX:
         return True, f"ask<={FILL_ASK_MAX}"
     return False, ""
 
@@ -483,8 +476,7 @@ async def monitor_ws(cycle_num: int, market: MarketInfo) -> CycleResult:
     up   = LegState("UP")
     down = LegState("DOWN")
 
-    log.info(f"  WS monitoring → {ts_to_hms(market.end_ts)}  "
-             f"(fill: bid<={FILL_BID_MAX} | ask<={FILL_ASK_MAX})")
+    log.info(f"  WS monitoring → {ts_to_hms(market.end_ts)}  (fill: ask<={FILL_ASK_MAX})")
 
     last_status_log = now_ts()
 
@@ -616,7 +608,7 @@ async def main():
     log.info("=" * 64)
     log.info("  BTC 5-Min Up/Down Bot  —  WebSocket Edition")
     log.info(f"  Mode       : {'DRY RUN (no real orders)' if DRY_RUN else '*** LIVE TRADING ***'}")
-    log.info(f"  Limit      : {LIMIT_PRICE}   Fill: bid<={FILL_BID_MAX} | ask<={FILL_ASK_MAX}")
+    log.info(f"  Limit      : {LIMIT_PRICE}   Fill condition: ask<={FILL_ASK_MAX}")
     log.info(f"  Size       : {ORDER_SIZE} shares/leg   Pre-market: {PRE_MARKET_SECS}s")
     log.info(f"  WS latency : event-driven (~ms vs 2s polling)")
     log.info("=" * 64)
