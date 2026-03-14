@@ -262,9 +262,10 @@ def _parse_one(msg: dict, etype: str, results: list):
 
 async def ws_engine(stop: asyncio.Event):
     """
-    Runs forever (until stop is set). Reconnects on any error.
-    Pumps incoming price data into ws_prices.
-    Drains _ws_out queue for subscribe/unsubscribe messages.
+    Persistent WS connection. Reconnects automatically on any failure.
+    - No receive_timeout: we keep alive via explicit PING every 10s
+    - PING sent immediately on connect (before any subscription)
+    - Re-subscribes to all known tokens after reconnect
     """
     while not stop.is_set():
         try:
@@ -272,35 +273,41 @@ async def ws_engine(stop: asyncio.Event):
             async with aiohttp.ClientSession() as sess:
                 async with sess.ws_connect(
                     WS_MARKET_URL,
-                    receive_timeout=30,
-                    heartbeat=None,
+                    receive_timeout=None,   # never timeout on receive — PING handles keepalive
+                    heartbeat=None,         # we do manual PING/PONG, not aiohttp heartbeat
                 ) as ws:
                     log.info("WS connected ✓")
 
-                    # Re-subscribe on reconnect
+                    # Send PING immediately so server knows we're alive
+                    # (required even before any subscription)
+                    await ws.send_str("PING")
+
+                    # Re-subscribe to any active tokens from before reconnect
                     if _subscribed:
                         await ws.send_str(json.dumps({
                             "assets_ids": list(_subscribed),
                             "type": "market",
                             "custom_feature_enabled": True,
                         }))
+                        log.debug(f"WS re-subscribed: {len(_subscribed)} tokens")
 
-                    # Sender coroutine drains the outgoing queue
+                    # Drains outgoing queue (subscribe/unsubscribe messages)
                     async def _sender():
                         while True:
                             msg = await _ws_out.get()
                             try:
                                 await ws.send_str(msg)
                             except Exception:
-                                await _ws_out.put(msg)   # re-queue for next connection
+                                await _ws_out.put(msg)  # re-queue for next connection
                                 return
 
-                    # Pinger keeps connection alive
+                    # Sends PING every WS_PING_INTERVAL seconds
                     async def _pinger():
                         while True:
                             await asyncio.sleep(WS_PING_INTERVAL)
                             try:
                                 await ws.send_str("PING")
+                                log.debug("WS PING sent")
                             except Exception:
                                 return
 
@@ -313,6 +320,7 @@ async def ws_engine(stop: asyncio.Event):
                                 break
                             if wsmsg.type == aiohttp.WSMsgType.TEXT:
                                 if wsmsg.data == "PONG":
+                                    log.debug("WS PONG received")
                                     continue
                                 for token, bid, ask in _extract_prices(wsmsg.data):
                                     await ws_prices.update(token, bid, ask)
@@ -320,7 +328,7 @@ async def ws_engine(stop: asyncio.Event):
                                 aiohttp.WSMsgType.CLOSED,
                                 aiohttp.WSMsgType.ERROR,
                             ):
-                                log.warning(f"WS msg type={wsmsg.type} — reconnecting")
+                                log.warning(f"WS closed/error ({wsmsg.type}) — reconnecting")
                                 break
                     finally:
                         t_send.cancel()
@@ -329,7 +337,7 @@ async def ws_engine(stop: asyncio.Event):
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log.warning(f"WS engine error: {e}")
+            log.warning(f"WS engine exception: {e}")
 
         if not stop.is_set():
             await asyncio.sleep(WS_RECONNECT_DELAY)
