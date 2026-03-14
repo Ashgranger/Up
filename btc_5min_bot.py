@@ -277,7 +277,6 @@ async def ws_engine(stop: asyncio.Event):
             ws = await session.ws_connect(
                 WS_MARKET_URL,
                 ssl=True,
-                timeout=aiohttp.ClientWSTimeout(ws_connect=10),
             )
             log.info("WS connected ✓")
 
@@ -609,7 +608,8 @@ async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
         result = CycleResult(cycle=cycle_num, slug=market.slug,
                              start_ts=market.start_ts, skip_reason="placement failed")
         stats.record(result)
-        await ws_unsubscribe([market.up_token, market.down_token])
+        ws_prices._prices.pop(market.up_token, None)
+        ws_prices._prices.pop(market.down_token, None)
         return
 
     # Monitor via WS events
@@ -617,8 +617,11 @@ async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
     result.orders_placed = True
     stats.record(result)
 
-    # Clean up subscription
-    await ws_unsubscribe([market.up_token, market.down_token])
+    # Clear stale price cache for finished tokens (don't unsubscribe —
+    # keeping them in _subscribed means WS auto-resubscribes if it reconnects
+    # during the end-of-cycle wait, preventing the dead-prices bug)
+    ws_prices._prices.pop(market.up_token, None)
+    ws_prices._prices.pop(market.down_token, None)
 
     # Cycle summary
     log.info(f"  ── Cycle {cycle_num} result ──")
@@ -628,12 +631,25 @@ async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
                  f"last bid={leg.bid:.4f} ask={leg.ask:.4f}  WS={leg.updates}")
     stats.print_summary()
 
-    # Wait until this market fully ends before computing the next target.
-    # Without this, next_5min_start() could return the same market again.
+    # Wait until this market fully ends, and pre-subscribe to NEXT market
+    # tokens during the wait. This keeps the WS connection alive (has traffic)
+    # and means prices start flowing the moment next cycle begins.
     gap = market.end_ts - now_ts()
     if gap > 0:
-        log.info(f"  Market ends in {gap}s — waiting...")
-        await asyncio.sleep(gap + 2)   # +2s buffer past market close
+        log.info(f"  Market ends in {gap}s — pre-fetching next market...")
+        # Try to discover and subscribe to next market tokens while we wait
+        next_ts_upcoming = market.end_ts + 300  # market after this one
+        prefetch_wait = max(0, gap - 60)        # start prefetch 60s before end
+        if prefetch_wait > 0:
+            await asyncio.sleep(prefetch_wait)
+        # Try to subscribe to next market (may not exist yet — that's ok)
+        next_m = await fetch_market(session, next_ts_upcoming)
+        if next_m:
+            await ws_subscribe([next_m.up_token, next_m.down_token])
+            log.info(f"  Pre-subscribed next market tokens")
+        remaining_gap = market.end_ts - now_ts()
+        if remaining_gap > 0:
+            await asyncio.sleep(remaining_gap + 2)
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
