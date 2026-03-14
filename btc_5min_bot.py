@@ -346,8 +346,13 @@ def ts_to_hms(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S UTC")
 
 def next_5min_start() -> int:
+    """Return the next 5-min boundary whose order window hasn't passed yet."""
     now = now_ts()
-    return (now // 300) * 300 + 300
+    candidate = (now // 300) * 300 + 300
+    # If order window (start - PRE_MARKET_SECS) is already behind us, skip ahead
+    while candidate - PRE_MARKET_SECS < now:
+        candidate += 300
+    return candidate
 
 def slug_for_ts(ts: int) -> str:
     return f"btc-updown-5m-{ts}"
@@ -409,10 +414,15 @@ async def wait_for_market(session: aiohttp.ClientSession, ts: int) -> MarketInfo
 
 # ─── Fill logic ────────────────────────────────────────────────────────────────
 
+# Minimum bid to be considered a real quote (filters empty-book noise like 0.01)
+MIN_REAL_BID = 0.10
+MIN_REAL_ASK = 0.10
+
 def check_fill(bid: float, ask: float) -> tuple[bool, str]:
-    if 0 < bid <= FILL_BID_MAX:
+    # Ignore junk quotes from empty/pre-open book (bid=0.01, ask=0.99)
+    if bid >= MIN_REAL_BID and bid <= FILL_BID_MAX:
         return True, f"bid<={FILL_BID_MAX}"
-    if 0 < ask <= FILL_ASK_MAX:
+    if ask >= MIN_REAL_ASK and ask <= FILL_ASK_MAX:
         return True, f"ask<={FILL_ASK_MAX}"
     return False, ""
 
@@ -592,6 +602,13 @@ async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
         log.info(f"  {leg.name:<4} : {status:<28}  "
                  f"last bid={leg.bid:.4f} ask={leg.ask:.4f}  WS={leg.updates}")
     stats.print_summary()
+
+    # Wait until this market fully ends before computing the next target.
+    # Without this, next_5min_start() could return the same market again.
+    gap = market.end_ts - now_ts()
+    if gap > 0:
+        log.info(f"  Market ends in {gap}s — waiting...")
+        await asyncio.sleep(gap + 2)   # +2s buffer past market close
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
