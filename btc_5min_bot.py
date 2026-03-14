@@ -1,35 +1,24 @@
 """
-BTC 5-Minute Up/Down Fill-Detection Bot  (WebSocket edition)
-=============================================================
-
-Key upgrade: monitoring is now event-driven via Polymarket WebSocket.
-  - REST polling (old): ~2s latency per price update
-  - WebSocket (new):    <50ms latency, server pushes every top-of-book change
-
-Architecture:
-  - One persistent WebSocket connection runs the entire time
-  - Subscribes to UP+DOWN tokens as soon as market is found
-  - best_bid_ask events update shared state instantly
-  - price_change events used as fast fallback for fills
-  - book snapshot on subscribe gives immediate baseline
-  - REST fetches only used for market discovery (Gamma API)
-
+BTC 5-Minute Up/Down Fill-Detection Bot
+========================================
 Strategy per cycle:
-  1. Compute next 5-min market timestamp
-  2. Pre-subscribe to tokens ~4 min before start via WS
-  3. Place UP@0.47 and DOWN@0.47 at order_time
-  4. WS events fire fill detection in real-time until market end
-  5. Stats accumulated across all cycles
+  - Place UP@0.47 and DOWN@0.47 limit orders 4 min before market starts
+  - Monitor via WebSocket until market ends (9 min window total)
+  - Fill assumed when: ask <= 0.47 for either leg
 
-Fill conditions (per leg):
-  bid <= 0.45   OR   ask <= 0.47
+WebSocket design (bulletproof):
+  - Uses 'websockets' library (not aiohttp WS — aiohttp WS is flaky)
+  - Single persistent connection with auto-reconnect
+  - Sends subscribe message within 1s of connect (server closes after ~10s idle)
+  - PING every 8s
+  - On reconnect: re-subscribes all active tokens automatically
+  - If no prices after subscribe: REST fallback for initial snapshot
 
 Run:
-  python btc_5min_bot.py
+  pip install websockets aiohttp python-dotenv
+  python3 btc_5min_bot.py
 
-Env:
-  DRY_RUN=true   (default — no real orders)
-  DRY_RUN=false  + PRIVATE_KEY, API_KEY, API_SECRET, API_PASSPHRASE, FUNDER_ADDRESS
+Env: DRY_RUN=true (default). Set DRY_RUN=false + credentials for live trading.
 """
 
 import asyncio
@@ -48,18 +37,16 @@ load_dotenv()
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
-GAMMA_API        = "https://gamma-api.polymarket.com"
-CLOB_API         = "https://clob.polymarket.com"
-WS_MARKET_URL    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+GAMMA_API       = "https://gamma-api.polymarket.com"
+CLOB_API        = "https://clob.polymarket.com"
+WS_URL          = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-LIMIT_PRICE      = 0.47
-FILL_ASK_MAX     = 0.47   # Fill assumed when ask drops to/below this
-ORDER_SIZE       = 10
-PRE_MARKET_SECS  = 240        # Subscribe + place orders 4 min before start
-CYCLE_SECS       = 300
-WS_PING_INTERVAL = 10         # Polymarket requires PING every 10s
-WS_RECONNECT_DELAY = 2
-MONITOR_TICK     = 0.05       # 50ms inner loop — reacts within one event loop tick
+LIMIT_PRICE     = 0.47
+FILL_ASK_MAX    = 0.47   # Fill assumed when ask drops to/below this
+ORDER_SIZE      = 10
+PRE_MARKET_SECS = 240    # Place orders 4 min before market start
+PING_INTERVAL   = 8      # Send PING every 8s (server closes after ~10s idle)
+RECONNECT_DELAY = 1      # Seconds before reconnect attempt
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
@@ -69,6 +56,32 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("btc5m")
+
+# ─── Shared price state ────────────────────────────────────────────────────────
+
+class PriceStore:
+    def __init__(self):
+        self._data: dict[str, tuple[float, float]] = {}
+        self.updated = asyncio.Event()
+
+    def set(self, token: str, bid: float, ask: float):
+        prev = self._data.get(token)
+        self._data[token] = (bid, ask)
+        if prev != (bid, ask):
+            self.updated.set()
+            self.updated.clear()
+
+    def get(self, token: str) -> tuple[float, float]:
+        return self._data.get(token, (0.0, 1.0))
+
+    def clear(self, token: str):
+        self._data.pop(token, None)
+
+
+prices = PriceStore()
+
+# Active subscriptions — ws_engine re-sends these on every reconnect
+_active_tokens: set[str] = set()
 
 # ─── Data classes ──────────────────────────────────────────────────────────────
 
@@ -90,7 +103,7 @@ class LegState:
     fill_time:   float = 0.0
     bid:         float = 0.0
     ask:         float = 1.0
-    updates:     int   = 0    # WS price updates received
+    updates:     int   = 0
 
 
 @dataclass
@@ -104,25 +117,21 @@ class CycleResult:
     skip_reason:   str  = ""
 
     @property
-    def both_filled(self) -> bool:
+    def both_filled(self):
         return self.up.filled and self.down.filled
 
-    def summary(self) -> str:
-        up_s   = f"FILLED({self.up.fill_reason})"   if self.up.filled   else "not filled"
-        down_s = f"FILLED({self.down.fill_reason})"  if self.down.filled else "not filled"
+    def summary(self):
+        u = f"FILLED({self.up.fill_reason})"   if self.up.filled   else "not filled"
+        d = f"FILLED({self.down.fill_reason})"  if self.down.filled else "not filled"
         return (f"Cycle {self.cycle:>3} | {self.slug[-20:]} | "
-                f"UP={up_s:<22} DOWN={down_s}  "
-                f"[WS: UP={self.up.updates} DN={self.down.updates}]")
+                f"UP={u:<22} DOWN={d}  [WS: UP={self.up.updates} DN={self.down.updates}]")
 
 
 # ─── Stats ─────────────────────────────────────────────────────────────────────
 
 class Stats:
     def __init__(self):
-        self.cycles     = 0
-        self.up_fills   = 0
-        self.down_fills = 0
-        self.both_fills = 0
+        self.cycles = self.up_fills = self.down_fills = self.both_fills = 0
         self.results: list[CycleResult] = []
 
     def record(self, r: CycleResult):
@@ -132,296 +141,210 @@ class Stats:
         if r.both_filled: self.both_fills += 1
         self.results.append(r)
 
-    def print_summary(self):
-        print("\n" + "="*75)
-        print(f"  CUMULATIVE STATS  ({self.cycles} cycles)")
-        print("="*75)
+    def print(self):
+        print("\n" + "="*72)
+        print(f"  STATS  ({self.cycles} cycles)")
+        print("="*72)
         for r in self.results:
             m = " ✓✓" if r.both_filled else (" ✓ " if (r.up.filled or r.down.filled) else "   ")
             print(f"  {m} {r.summary()}")
-        print("-"*75)
+        print("-"*72)
         n = max(self.cycles, 1)
-        print(f"  Total cycles : {self.cycles}")
-        print(f"  UP filled    : {self.up_fills}  ({self.up_fills/n*100:.0f}%)")
-        print(f"  DOWN filled  : {self.down_fills}  ({self.down_fills/n*100:.0f}%)")
-        print(f"  Both filled  : {self.both_fills}  ({self.both_fills/n*100:.0f}%)")
-        print("="*75 + "\n")
+        print(f"  Total: {self.cycles}  UP: {self.up_fills}({self.up_fills/n*100:.0f}%)"
+              f"  DOWN: {self.down_fills}({self.down_fills/n*100:.0f}%)"
+              f"  Both: {self.both_fills}({self.both_fills/n*100:.0f}%)")
+        print("="*72 + "\n")
 
 
 stats = Stats()
-
-# ─── Shared WebSocket price state ──────────────────────────────────────────────
-
-class WSPriceState:
-    """
-    Thread-safe price store updated by ws_engine, read by monitor_ws.
-    Uses asyncio.Event to wake up monitor instantly on any price change.
-    """
-    def __init__(self):
-        self._prices: dict[str, tuple[float, float]] = {}
-        self._lock = asyncio.Lock()
-        self.changed = asyncio.Event()  # set on every update, cleared by monitor
-
-    async def update(self, token_id: str, bid: float, ask: float):
-        async with self._lock:
-            prev = self._prices.get(token_id)
-            self._prices[token_id] = (bid, ask)
-        if prev != (bid, ask):          # only wake monitor on actual change
-            self.changed.set()
-
-    def get(self, token_id: str) -> tuple[float, float]:
-        return self._prices.get(token_id, (0.0, 1.0))
-
-
-ws_prices = WSPriceState()
-
-# Active token subscriptions — ws_engine re-subs these on every reconnect
-_subscribed: set[str] = set()
-
-# Direct reference to the live WebSocket — set by ws_engine, None when down
-_ws_live = None
-
-
-async def ws_subscribe(tokens: list[str]):
-    """Add tokens and send subscribe immediately if WS is live."""
-    global _ws_live
-    new = [t for t in tokens if t not in _subscribed]
-    if not new:
-        return
-    _subscribed.update(new)
-    msg = json.dumps({
-        "assets_ids": new,
-        "type": "market",
-        "custom_feature_enabled": True,
-    })
-    if _ws_live and not _ws_live.closed:
-        try:
-            await _ws_live.send_str(msg)
-            log.info(f"WS subscribe sent: {len(new)} tokens")
-        except Exception as e:
-            log.warning(f"WS subscribe send failed (will re-sub on reconnect): {e}")
-    else:
-        log.info(f"WS subscribe queued (WS down, will send on reconnect): {len(new)} tokens")
-
-
-# ─── WebSocket engine (background task) ────────────────────────────────────────
-
-def _extract_prices(raw: str) -> list[tuple[str, float, float]]:
-    """
-    Parse WS message → list of (token_id, bid, ask).
-    Handles best_bid_ask (fastest), price_change, book (snapshot).
-    Polymarket sends events as a JSON array — we iterate over each item.
-    """
-    results = []
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        return results
-
-    # Polymarket wraps all events in a list: [{event_type: ...}, ...]
-    msgs = parsed if isinstance(parsed, list) else [parsed]
-
-    for msg in msgs:
-        if not isinstance(msg, dict):
-            continue
-        etype = msg.get("event_type")
-        _parse_one(msg, etype, results)
-
-    return results
-
-
-def _parse_one(msg: dict, etype: str, results: list):
-    if etype == "best_bid_ask":
-        # Dedicated top-of-book event — lowest latency path
-        token = msg.get("asset_id") or msg.get("token_id")
-        if token:
-            bid = float(msg.get("best_bid") or 0)
-            ask = float(msg.get("best_ask") or 1)
-            results.append((token, bid, ask))
-
-    elif etype == "price_change":
-        for pc in msg.get("price_changes", []):
-            token = pc.get("asset_id")
-            if not token:
-                continue
-            bid_s = pc.get("best_bid", "")
-            ask_s = pc.get("best_ask", "")
-            if bid_s and ask_s:
-                bid = float(bid_s)
-                ask = float(ask_s)
-                if bid > 0 or ask < 1:
-                    results.append((token, bid, ask))
-
-    elif etype == "book":
-        # Full book snapshot sent right after subscribing
-        token = msg.get("asset_id")
-        if token:
-            bids = msg.get("bids", [])
-            asks = msg.get("asks", [])
-            bid = float(bids[0]["price"]) if bids else 0.0
-            ask = float(asks[0]["price"]) if asks else 1.0
-            results.append((token, bid, ask))
-
-
-async def ws_engine(stop: asyncio.Event):
-    """
-    Persistent WebSocket.
-    - Sets _ws_live so ws_subscribe() can send directly
-    - Always re-subscribes _subscribed tokens on reconnect
-    - PING every 4s (server closes after ~10s idle)
-    """
-    global _ws_live
-    while not stop.is_set():
-        session = None
-        ws      = None
-        try:
-            log.info("WS connecting...")
-            session = aiohttp.ClientSession()
-            ws = await session.ws_connect(WS_MARKET_URL, ssl=True)
-            _ws_live = ws
-            log.info("WS connected ✓")
-
-            # Always subscribe immediately — required within ~10s
-            tokens_now = list(_subscribed)
-            if tokens_now:
-                await ws.send_str(json.dumps({
-                    "assets_ids": tokens_now,
-                    "type": "market",
-                    "custom_feature_enabled": True,
-                }))
-                log.info(f"WS re-subscribed {len(tokens_now)} tokens")
-            else:
-                # No tokens yet — send PING to satisfy server handshake
-                await ws.send_str("PING")
-                log.debug("WS PING (no tokens yet)")
-
-            last_ping = time.time()
-
-            while not stop.is_set():
-                # 4s receive timeout — ensures PING fires before server's ~10s idle limit
-                try:
-                    wsmsg = await asyncio.wait_for(ws.receive(), timeout=4.0)
-                except asyncio.TimeoutError:
-                    await ws.send_str("PING")
-                    last_ping = time.time()
-                    log.debug("WS PING (keepalive)")
-                    continue
-                except Exception as e:
-                    log.error(f"WS receive error: {e}")
-                    break
-
-                # Periodic PING regardless of traffic
-                if time.time() - last_ping >= 5.0:
-                    await ws.send_str("PING")
-                    last_ping = time.time()
-
-                if wsmsg.type == aiohttp.WSMsgType.TEXT:
-                    if wsmsg.data == "PONG":
-                        log.debug("WS PONG ←")
-                        continue
-                    for token, bid, ask in _extract_prices(wsmsg.data):
-                        await ws_prices.update(token, bid, ask)
-
-                elif wsmsg.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSING,
-                    aiohttp.WSMsgType.ERROR,
-                ):
-                    log.warning(f"WS server closed (type={wsmsg.type}) — reconnecting")
-                    break
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            import traceback as _tb
-            log.error(f"WS engine crashed: {type(e).__name__}: {e}")
-            log.error(_tb.format_exc())
-        finally:
-            _ws_live = None
-            if ws:
-                try: await ws.close()
-                except Exception: pass
-            if session:
-                try: await session.close()
-                except Exception: pass
-
-        if not stop.is_set():
-            log.info(f"WS reconnecting in {WS_RECONNECT_DELAY}s...")
-            await asyncio.sleep(WS_RECONNECT_DELAY)
-
-    log.info("WS engine stopped")
-
-
-
-
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
 def now_ts() -> int:
     return int(time.time())
 
-def ts_to_hms(ts: int) -> str:
+def ts_hms(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S UTC")
 
-def next_5min_start() -> int:
-    """Return the next 5-min boundary whose order window hasn't passed yet."""
+def next_market_start() -> int:
     now = now_ts()
     candidate = (now // 300) * 300 + 300
-    # If order window (start - PRE_MARKET_SECS) is already behind us, skip ahead
     while candidate - PRE_MARKET_SECS < now:
         candidate += 300
     return candidate
 
-def slug_for_ts(ts: int) -> str:
+def slug_for(ts: int) -> str:
     return f"btc-updown-5m-{ts}"
 
-async def http_get(session: aiohttp.ClientSession, url: str, params: dict = None):
+async def http_get(session: aiohttp.ClientSession, url: str, params=None):
     async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
         r.raise_for_status()
         return await r.json()
 
-# ─── Market discovery (REST) ───────────────────────────────────────────────────
+# ─── WS message parser ─────────────────────────────────────────────────────────
+
+def parse_ws(raw: str) -> list[tuple[str, float, float]]:
+    """Parse WS message → list of (token, bid, ask)."""
+    out = []
+    try:
+        msgs = json.loads(raw)
+    except Exception:
+        return out
+    if isinstance(msgs, dict):
+        msgs = [msgs]
+    for msg in msgs:
+        if not isinstance(msg, dict):
+            continue
+        et = msg.get("event_type")
+        if et == "best_bid_ask":
+            t = msg.get("asset_id") or msg.get("token_id")
+            if t:
+                out.append((t, float(msg.get("best_bid") or 0), float(msg.get("best_ask") or 1)))
+        elif et == "price_change":
+            for pc in msg.get("price_changes", []):
+                t = pc.get("asset_id")
+                b, a = pc.get("best_bid"), pc.get("best_ask")
+                if t and b and a:
+                    out.append((t, float(b), float(a)))
+        elif et == "book":
+            t = msg.get("asset_id")
+            if t:
+                bids = msg.get("bids", [])
+                asks = msg.get("asks", [])
+                b = float(bids[0]["price"]) if bids else 0.0
+                a = float(asks[0]["price"]) if asks else 1.0
+                out.append((t, b, a))
+    return out
+
+# ─── WebSocket engine ──────────────────────────────────────────────────────────
+
+async def ws_engine(stop: asyncio.Event):
+    """
+    Persistent WS using 'websockets' library.
+    Reconnects automatically. Re-subscribes all active tokens on reconnect.
+    Sends subscribe message immediately on connect to prevent server-side close.
+    """
+    try:
+        import websockets
+    except ImportError:
+        log.error("'websockets' not installed. Run: pip install websockets")
+        return
+
+    while not stop.is_set():
+        try:
+            log.info("WS connecting...")
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=None,   # we handle PING manually
+                ping_timeout=None,
+                close_timeout=5,
+                open_timeout=10,
+            ) as ws:
+                log.info("WS connected ✓")
+
+                # Send subscribe immediately — server closes after ~10s if nothing sent
+                sub_tokens = list(_active_tokens)
+                await ws.send(json.dumps({
+                    "assets_ids": sub_tokens,
+                    "type": "market",
+                    "custom_feature_enabled": True,
+                }))
+                if sub_tokens:
+                    log.info(f"WS subscribed {len(sub_tokens)} tokens")
+                else:
+                    log.debug("WS sent empty subscribe (keepalive)")
+
+                last_ping = time.time()
+
+                while not stop.is_set():
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=4.0)
+                    except asyncio.TimeoutError:
+                        # No message in 4s — send PING to stay alive
+                        await ws.send("PING")
+                        last_ping = time.time()
+                        log.debug("WS PING (keepalive)")
+                        continue
+                    except Exception as e:
+                        log.warning(f"WS recv error: {e}")
+                        break
+
+                    if time.time() - last_ping >= PING_INTERVAL:
+                        await ws.send("PING")
+                        last_ping = time.time()
+
+                    if raw == "PONG":
+                        log.debug("WS PONG")
+                        continue
+
+                    for token, bid, ask in parse_ws(raw):
+                        prices.set(token, bid, ask)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning(f"WS error: {type(e).__name__}: {e}")
+
+        if not stop.is_set():
+            log.info(f"WS reconnecting in {RECONNECT_DELAY}s...")
+            await asyncio.sleep(RECONNECT_DELAY)
+
+    log.info("WS stopped")
+
+
+async def subscribe(tokens: list[str]):
+    """Register tokens so ws_engine re-subs them on reconnect."""
+    _active_tokens.update(tokens)
+
+
+async def unsubscribe(tokens: list[str]):
+    """Remove tokens from active set and clear cached prices."""
+    for t in tokens:
+        _active_tokens.discard(t)
+        prices.clear(t)
+
+# ─── Market discovery ──────────────────────────────────────────────────────────
 
 async def fetch_market(session: aiohttp.ClientSession, ts: int) -> Optional[MarketInfo]:
-    slug = slug_for_ts(ts)
+    slug = slug_for(ts)
     try:
         data = await http_get(session, f"{GAMMA_API}/markets", params={"slug": slug})
     except Exception as e:
         log.debug(f"Gamma error ({slug}): {e}")
         return None
 
-    market = data[0] if isinstance(data, list) else data
-    if not market:
+    m = data[0] if isinstance(data, list) else data
+    if not m:
         return None
 
-    raw_tokens = market.get("clobTokenIds", [])
-    if isinstance(raw_tokens, str):
-        raw_tokens = json.loads(raw_tokens)
-    if not raw_tokens or len(raw_tokens) < 2:
+    tokens = m.get("clobTokenIds", [])
+    if isinstance(tokens, str):
+        tokens = json.loads(tokens)
+    if not tokens or len(tokens) < 2:
         return None
 
-    raw_outcomes = market.get("outcomes", '["Up","Down"]')
-    if isinstance(raw_outcomes, str):
-        raw_outcomes = json.loads(raw_outcomes)
+    outcomes = m.get("outcomes", '["Up","Down"]')
+    if isinstance(outcomes, str):
+        outcomes = json.loads(outcomes)
 
-    up_idx, down_idx = 0, 1
-    for i, o in enumerate(raw_outcomes):
+    ui, di = 0, 1
+    for i, o in enumerate(outcomes):
         s = str(o).lower()
-        if s in ("up", "yes"):    up_idx   = i
-        elif s in ("down", "no"): down_idx = i
+        if s in ("up", "yes"):    ui = i
+        elif s in ("down", "no"): di = i
 
     return MarketInfo(
-        slug       = slug,
-        condition  = market.get("conditionId", ""),
-        up_token   = raw_tokens[up_idx],
-        down_token = raw_tokens[down_idx],
-        start_ts   = ts,
-        end_ts     = ts + 300,
+        slug      = slug,
+        condition = m.get("conditionId", ""),
+        up_token  = tokens[ui],
+        down_token= tokens[di],
+        start_ts  = ts,
+        end_ts    = ts + 300,
     )
 
 
 async def wait_for_market(session: aiohttp.ClientSession, ts: int) -> MarketInfo:
-    log.info(f"Waiting for market: {slug_for_ts(ts)}")
+    log.info(f"Waiting for market: {slug_for(ts)}")
     while True:
         m = await fetch_market(session, ts)
         if m:
@@ -430,10 +353,25 @@ async def wait_for_market(session: aiohttp.ClientSession, ts: int) -> MarketInfo
             return m
         await asyncio.sleep(5)
 
-# ─── Fill logic ────────────────────────────────────────────────────────────────
+# ─── REST price fallback ────────────────────────────────────────────────────────
 
-def check_fill(bid: float, ask: float) -> tuple[bool, str]:
-    # Fill assumed only when ask <= FILL_ASK_MAX (someone willing to sell at/below our limit)
+async def fetch_prices_rest(session: aiohttp.ClientSession, market: MarketInfo):
+    """Fetch book via REST and seed PriceStore — used when WS snapshot is slow."""
+    for token, name in [(market.up_token, "UP"), (market.down_token, "DOWN")]:
+        try:
+            data = await http_get(session, f"{CLOB_API}/book", params={"token_id": token})
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            bid = float(bids[0]["price"]) if bids else 0.0
+            ask = float(asks[0]["price"]) if asks else 1.0
+            prices.set(token, bid, ask)
+            log.info(f"  REST snapshot {name}: bid={bid:.4f} ask={ask:.4f}")
+        except Exception as e:
+            log.warning(f"  REST snapshot {name} failed: {e}")
+
+# ─── Fill check ────────────────────────────────────────────────────────────────
+
+def check_fill(ask: float) -> tuple[bool, str]:
     if 0 < ask <= FILL_ASK_MAX:
         return True, f"ask<={FILL_ASK_MAX}"
     return False, ""
@@ -449,30 +387,21 @@ async def place_orders(session: aiohttp.ClientSession, market: MarketInfo) -> bo
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import OrderArgs, OrderType, ApiCreds
         from py_clob_client.order_builder.constants import BUY
-
         creds = ApiCreds(
-            api_key        = os.environ["API_KEY"],
-            api_secret     = os.environ["API_SECRET"],
-            api_passphrase = os.environ["API_PASSPHRASE"],
+            api_key=os.environ["API_KEY"],
+            api_secret=os.environ["API_SECRET"],
+            api_passphrase=os.environ["API_PASSPHRASE"],
         )
-        client = ClobClient(
-            host           = CLOB_API,
-            key            = os.environ["PRIVATE_KEY"],
-            chain_id       = 137,
-            creds          = creds,
-            signature_type = 2,
-            funder         = os.environ["FUNDER_ADDRESS"],
-        )
+        client = ClobClient(CLOB_API, key=os.environ["PRIVATE_KEY"], chain_id=137,
+                            creds=creds, signature_type=2, funder=os.environ["FUNDER_ADDRESS"])
         opts = {"tick_size": "0.01", "neg_risk": False}
         loop = asyncio.get_event_loop()
         up_r, dn_r = await asyncio.gather(
             loop.run_in_executor(None, lambda: client.create_and_post_order(
-                OrderArgs(token_id=market.up_token,   price=LIMIT_PRICE,
-                          size=ORDER_SIZE, side=BUY),
+                OrderArgs(token_id=market.up_token,   price=LIMIT_PRICE, size=ORDER_SIZE, side=BUY),
                 options=opts, order_type=OrderType.GTC)),
             loop.run_in_executor(None, lambda: client.create_and_post_order(
-                OrderArgs(token_id=market.down_token, price=LIMIT_PRICE,
-                          size=ORDER_SIZE, side=BUY),
+                OrderArgs(token_id=market.down_token, price=LIMIT_PRICE, size=ORDER_SIZE, side=BUY),
                 options=opts, order_type=OrderType.GTC)),
         )
         log.info(f"  UP   order: {up_r.get('orderID','?')}  status={up_r.get('status','?')}")
@@ -482,110 +411,123 @@ async def place_orders(session: aiohttp.ClientSession, market: MarketInfo) -> bo
         log.error(f"Order placement failed: {e}")
         return False
 
-# ─── WS-driven monitor ─────────────────────────────────────────────────────────
+# ─── Monitor ───────────────────────────────────────────────────────────────────
 
-async def monitor_ws(cycle_num: int, market: MarketInfo) -> CycleResult:
-    """
-    Event-driven monitoring.  Instead of sleeping N seconds between polls,
-    the inner loop wakes immediately whenever ws_prices.changed fires —
-    which happens on every best_bid_ask / price_change WS event (~ms latency).
-    Falls back to MONITOR_TICK (50ms) timeout if no event arrives.
-    """
+async def monitor(session: aiohttp.ClientSession, cycle_num: int, market: MarketInfo) -> CycleResult:
     result = CycleResult(cycle=cycle_num, slug=market.slug, start_ts=market.start_ts)
     up   = LegState("UP")
     down = LegState("DOWN")
 
-    log.info(f"  WS monitoring → {ts_to_hms(market.end_ts)}  (fill: ask<={FILL_ASK_MAX})")
-
-    last_status_log = now_ts()
+    log.info(f"  Monitoring → {ts_hms(market.end_ts)}  (fill: ask<={FILL_ASK_MAX})")
+    last_log  = now_ts()
+    rest_done = False
 
     while now_ts() < market.end_ts:
-        # Wait for a WS price update OR MONITOR_TICK timeout — whichever comes first
+        # Wait for WS update or 0.5s timeout
         try:
-            await asyncio.wait_for(ws_prices.changed.wait(), timeout=MONITOR_TICK)
-            ws_prices.changed.clear()
+            await asyncio.wait_for(prices.updated.wait(), timeout=0.5)
         except asyncio.TimeoutError:
             pass
 
-        remaining = market.end_ts - now_ts()
-        t = time.time()
+        up_bid,  up_ask  = prices.get(market.up_token)
+        dn_bid,  dn_ask  = prices.get(market.down_token)
 
-        up_bid,  up_ask  = ws_prices.get(market.up_token)
-        dn_bid,  dn_ask  = ws_prices.get(market.down_token)
+        # If WS not delivering after 5s — fall back to REST once
+        if not rest_done and now_ts() - market.start_ts + PRE_MARKET_SECS > 5:
+            if up_ask >= 1.0 and dn_ask >= 1.0:
+                log.warning("  No WS prices after 5s — fetching via REST")
+                await fetch_prices_rest(session, market)
+                rest_done = True
+                continue
 
-        # Count actual price changes (not just wakeups)
+        # Track changes
         if (up_bid, up_ask) != (up.bid, up.ask):
             up.bid, up.ask = up_bid, up_ask
             up.updates += 1
-
         if (dn_bid, dn_ask) != (down.bid, down.ask):
             down.bid, down.ask = dn_bid, dn_ask
             down.updates += 1
 
-        # Fill checks
+        t = time.time()
+        remaining = market.end_ts - now_ts()
+
         if not up.filled:
-            ok, reason = check_fill(up_bid, up_ask)
+            ok, reason = check_fill(up_ask)
             if ok:
                 up.filled = True; up.fill_reason = reason; up.fill_time = t
                 phase = "PRE" if now_ts() < market.start_ts else "LIVE"
-                log.info(f"  ★ UP FILLED  [{phase} +{(t - market.start_ts):.1f}s / {remaining}s left]  "
-                         f"{reason}  bid={up_bid:.4f} ask={up_ask:.4f}")
+                log.info(f"  ★ UP FILLED [{phase} {remaining}s left]  {reason}  "
+                         f"bid={up_bid:.4f} ask={up_ask:.4f}")
 
         if not down.filled:
-            ok, reason = check_fill(dn_bid, dn_ask)
+            ok, reason = check_fill(dn_ask)
             if ok:
                 down.filled = True; down.fill_reason = reason; down.fill_time = t
                 phase = "PRE" if now_ts() < market.start_ts else "LIVE"
-                log.info(f"  ★ DOWN FILLED [{phase} +{(t - market.start_ts):.1f}s / {remaining}s left]  "
-                         f"{reason}  bid={dn_bid:.4f} ask={dn_ask:.4f}")
-
-        # Periodic status — every 30s
-        if now_ts() - last_status_log >= 30:
-            phase = "PRE" if now_ts() < market.start_ts else "LIVE"
-            u = "filled" if up.filled   else f"bid={up_bid:.4f} ask={up_ask:.4f}"
-            d = "filled" if down.filled else f"bid={dn_bid:.4f} ask={dn_ask:.4f}"
-            log.info(f"  [{phase} {remaining:>3}s left]  UP: {u}  DOWN: {d}  "
-                     f"WS events: UP={up.updates} DN={down.updates}")
-            last_status_log = now_ts()
+                log.info(f"  ★ DOWN FILLED [{phase} {remaining}s left]  {reason}  "
+                         f"bid={dn_bid:.4f} ask={dn_ask:.4f}")
 
         if up.filled and down.filled:
-            log.info("  ✓ Both legs filled — exiting monitor early")
+            log.info("  ✓ Both filled — done early")
             break
+
+        if now_ts() - last_log >= 30:
+            phase = "PRE" if now_ts() < market.start_ts else "LIVE"
+            u_s = "filled" if up.filled   else f"bid={up_bid:.4f} ask={up_ask:.4f}"
+            d_s = "filled" if down.filled else f"bid={dn_bid:.4f} ask={dn_ask:.4f}"
+            log.info(f"  [{phase} {remaining:>3}s]  UP: {u_s}  DOWN: {d_s}  "
+                     f"WS: UP={up.updates} DN={down.updates}")
+            last_log = now_ts()
 
     result.up   = up
     result.down = down
     return result
 
-# ─── One full cycle ────────────────────────────────────────────────────────────
+# ─── One cycle ─────────────────────────────────────────────────────────────────
 
 async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
-    next_ts    = next_5min_start()
+    next_ts    = next_market_start()
     order_time = next_ts - PRE_MARKET_SECS
 
     log.info("")
     log.info(f"{'─'*64}")
-    log.info(f"  CYCLE {cycle_num}  |  {slug_for_ts(next_ts)}")
-    log.info(f"  Market start : {ts_to_hms(next_ts)}   end: {ts_to_hms(next_ts+300)}")
-    log.info(f"  Order time   : {ts_to_hms(order_time)}")
+    log.info(f"  CYCLE {cycle_num}  |  {slug_for(next_ts)}")
+    log.info(f"  Market: {ts_hms(next_ts)} → {ts_hms(next_ts+300)}   Orders @ {ts_hms(order_time)}")
     log.info(f"{'─'*64}")
 
+    # Sleep until order time
     wait = order_time - now_ts()
     if wait > 0:
         log.info(f"  Sleeping {wait:.0f}s...")
         await asyncio.sleep(wait)
 
-    # Discover market via REST
+    # Discover market
     market = await wait_for_market(session, next_ts)
 
-    # Subscribe BEFORE placing orders — book snapshot arrives immediately
-    await ws_subscribe([market.up_token, market.down_token])
-    log.info("  WS subscribed — book snapshot incoming...")
-    await asyncio.sleep(0.3)   # brief settle for snapshot
+    # Register tokens with WS engine
+    await subscribe([market.up_token, market.down_token])
+    log.info("  Waiting for WS book snapshot (up to 8s)...")
 
-    up_b, up_a = ws_prices.get(market.up_token)
-    dn_b, dn_a = ws_prices.get(market.down_token)
-    log.info(f"  Initial prices — UP: bid={up_b:.4f} ask={up_a:.4f}  "
-             f"DOWN: bid={dn_b:.4f} ask={dn_a:.4f}")
+    # Wait up to 8s for real prices to arrive via WS
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        await asyncio.sleep(0.3)
+        ub, ua = prices.get(market.up_token)
+        db, da = prices.get(market.down_token)
+        if ua < 1.0 or da < 1.0:
+            break
+
+    ua_now = prices.get(market.up_token)[1]
+    da_now = prices.get(market.down_token)[1]
+
+    # If still no WS prices — fetch via REST
+    if ua_now >= 1.0 and da_now >= 1.0:
+        log.warning("  WS snapshot not received — using REST fallback")
+        await fetch_prices_rest(session, market)
+
+    ub, ua = prices.get(market.up_token)
+    db, da = prices.get(market.down_token)
+    log.info(f"  Prices — UP: bid={ub:.4f} ask={ua:.4f}  DOWN: bid={db:.4f} ask={da:.4f}")
 
     # Place orders
     log.info(f"  Placing orders ({'DRY RUN' if DRY_RUN else 'LIVE'})...")
@@ -595,58 +537,43 @@ async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
         result = CycleResult(cycle=cycle_num, slug=market.slug,
                              start_ts=market.start_ts, skip_reason="placement failed")
         stats.record(result)
-        ws_prices._prices.pop(market.up_token, None)
-        ws_prices._prices.pop(market.down_token, None)
+        await unsubscribe([market.up_token, market.down_token])
         return
 
-    # Monitor via WS events
-    result = await monitor_ws(cycle_num, market)
+    # Monitor
+    result = await monitor(session, cycle_num, market)
     result.orders_placed = True
     stats.record(result)
-
-    # Clear stale price cache for finished tokens (don't unsubscribe —
-    # keeping them in _subscribed means WS auto-resubscribes if it reconnects
-    # during the end-of-cycle wait, preventing the dead-prices bug)
-    ws_prices._prices.pop(market.up_token, None)
-    ws_prices._prices.pop(market.down_token, None)
 
     # Cycle summary
     log.info(f"  ── Cycle {cycle_num} result ──")
     for leg in (result.up, result.down):
-        status = f"FILLED ({leg.fill_reason})" if leg.filled else "NOT FILLED"
-        log.info(f"  {leg.name:<4} : {status:<28}  "
-                 f"last bid={leg.bid:.4f} ask={leg.ask:.4f}  WS={leg.updates}")
-    stats.print_summary()
+        s = f"FILLED ({leg.fill_reason})" if leg.filled else "NOT FILLED"
+        log.info(f"  {leg.name:<4}: {s:<28} bid={leg.bid:.4f} ask={leg.ask:.4f}  WS={leg.updates}")
+    stats.print()
 
-    # Wait until this market fully ends, and pre-subscribe to NEXT market
-    # tokens during the wait. This keeps the WS connection alive (has traffic)
-    # and means prices start flowing the moment next cycle begins.
+    # Clean up and wait for market to end
+    await unsubscribe([market.up_token, market.down_token])
     gap = market.end_ts - now_ts()
     if gap > 0:
-        log.info(f"  Market ends in {gap}s — pre-fetching next market...")
-        # Try to discover and subscribe to next market tokens while we wait
-        next_ts_upcoming = market.end_ts + 300  # market after this one
-        prefetch_wait = max(0, gap - 60)        # start prefetch 60s before end
-        if prefetch_wait > 0:
-            await asyncio.sleep(prefetch_wait)
-        # Try to subscribe to next market (may not exist yet — that's ok)
-        next_m = await fetch_market(session, next_ts_upcoming)
-        if next_m:
-            await ws_subscribe([next_m.up_token, next_m.down_token])
-            log.info(f"  Pre-subscribed next market tokens")
-        remaining_gap = market.end_ts - now_ts()
-        if remaining_gap > 0:
-            await asyncio.sleep(remaining_gap + 2)
+        log.info(f"  Waiting {gap}s for market to close...")
+        await asyncio.sleep(gap + 2)
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
+    # Check websockets is available
+    try:
+        import websockets
+    except ImportError:
+        print("ERROR: websockets not installed. Run: pip install websockets")
+        return
+
     log.info("=" * 64)
-    log.info("  BTC 5-Min Up/Down Bot  —  WebSocket Edition")
-    log.info(f"  Mode       : {'DRY RUN (no real orders)' if DRY_RUN else '*** LIVE TRADING ***'}")
-    log.info(f"  Limit      : {LIMIT_PRICE}   Fill condition: ask<={FILL_ASK_MAX}")
-    log.info(f"  Size       : {ORDER_SIZE} shares/leg   Pre-market: {PRE_MARKET_SECS}s")
-    log.info(f"  WS latency : event-driven (~ms vs 2s polling)")
+    log.info("  BTC 5-Min Up/Down Bot")
+    log.info(f"  Mode : {'DRY RUN' if DRY_RUN else '*** LIVE TRADING ***'}")
+    log.info(f"  Fill : ask<={FILL_ASK_MAX}   Limit: {LIMIT_PRICE}   Size: {ORDER_SIZE}")
+    log.info(f"  Pre-market: {PRE_MARKET_SECS}s   PING every {PING_INTERVAL}s")
     log.info("=" * 64)
 
     stop = asyncio.Event()
@@ -676,7 +603,7 @@ async def main():
         pass
 
     log.info("Stopped.")
-    stats.print_summary()
+    stats.print()
 
 
 if __name__ == "__main__":
