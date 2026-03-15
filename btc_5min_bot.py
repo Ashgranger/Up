@@ -197,24 +197,45 @@ def parse_ws(raw: str) -> list[tuple[str, float, float]]:
         if not isinstance(msg, dict):
             continue
         et = msg.get("event_type")
+
         if et == "best_bid_ask":
+            # Fastest path — dedicated top-of-book event
             t = msg.get("asset_id") or msg.get("token_id")
             if t:
-                out.append((t, float(msg.get("best_bid") or 0), float(msg.get("best_ask") or 1)))
+                bid = float(msg.get("best_bid") or 0)
+                ask = float(msg.get("best_ask") or 1)
+                out.append((t, bid, ask))
+
         elif et == "price_change":
             for pc in msg.get("price_changes", []):
                 t = pc.get("asset_id")
-                b, a = pc.get("best_bid"), pc.get("best_ask")
-                if t and b and a:
+                if not t:
+                    continue
+                b = pc.get("best_bid", "")
+                a = pc.get("best_ask", "")
+                # best_bid/best_ask may be empty string when level removed
+                if b and a:
                     out.append((t, float(b), float(a)))
+
         elif et == "book":
+            # Full snapshot on subscribe.
+            # bids sorted descending → bids[0] = best bid (highest)
+            # asks sorted ascending  → asks[0] = best ask (lowest)
             t = msg.get("asset_id")
             if t:
                 bids = msg.get("bids", [])
                 asks = msg.get("asks", [])
-                b = float(bids[0]["price"]) if bids else 0.0
-                a = float(asks[0]["price"]) if asks else 1.0
-                out.append((t, b, a))
+                # Sort defensively to ensure correct order
+                try:
+                    best_bid = max((float(x["price"]) for x in bids), default=0.0)
+                except Exception:
+                    best_bid = 0.0
+                try:
+                    best_ask = min((float(x["price"]) for x in asks), default=1.0)
+                except Exception:
+                    best_ask = 1.0
+                out.append((t, best_bid, best_ask))
+
     return out
 
 # ─── WebSocket engine ──────────────────────────────────────────────────────────
@@ -381,31 +402,20 @@ async def wait_for_market(session: aiohttp.ClientSession, ts: int) -> MarketInfo
 # ─── REST price fallback ────────────────────────────────────────────────────────
 
 async def fetch_prices_rest(session: aiohttp.ClientSession, market: MarketInfo):
-    """Fetch best bid/ask via REST. Uses both /book and /price for accuracy."""
+    """Fetch best bid/ask via REST /price endpoint (canonical per docs).
+    BUY price = best ask (lowest sell offer)
+    SELL price = best bid (highest buy offer)
+    """
     for token, name in [(market.up_token, "UP"), (market.down_token, "DOWN")]:
         try:
-            # /book gives full depth
-            data = await http_get(session, f"{CLOB_API}/book", params={"token_id": token})
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
-            bid = float(bids[0]["price"]) if bids else 0.0
-            ask = float(asks[0]["price"]) if asks else 1.0
-
-            # Filter out empty-book placeholder (0.01 bid / 0.99 ask = no real liquidity)
-            if bid <= 0.01 and ask >= 0.99:
-                # Double-check with /price endpoint
-                try:
-                    buy_data  = await http_get(session, f"{CLOB_API}/price",
-                                               params={"token_id": token, "side": "BUY"})
-                    sell_data = await http_get(session, f"{CLOB_API}/price",
-                                              params={"token_id": token, "side": "SELL"})
-                    ask = float(buy_data.get("price", ask))
-                    bid = float(sell_data.get("price", bid))
-                except Exception:
-                    pass  # stick with book values
-
+            buy_r, sell_r = await asyncio.gather(
+                http_get(session, f"{CLOB_API}/price", params={"token_id": token, "side": "BUY"}),
+                http_get(session, f"{CLOB_API}/price", params={"token_id": token, "side": "SELL"}),
+            )
+            ask = float(buy_r.get("price", 1.0))   # BUY price = best ask
+            bid = float(sell_r.get("price", 0.0))  # SELL price = best bid
             prices.set(token, bid, ask)
-            empty = " (empty book)" if bid <= 0.01 and ask >= 0.99 else ""
+            empty = " ⚠ empty book" if bid <= 0.01 and ask >= 0.99 else ""
             log.info(f"  REST {name}: bid={bid:.4f} ask={ask:.4f}{empty}")
         except Exception as e:
             log.warning(f"  REST {name} failed: {e}")
@@ -540,7 +550,10 @@ async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
     log.info("")
     log.info(f"{'─'*64}")
     log.info(f"  CYCLE {cycle_num}  |  {slug_for(next_ts)}")
-    log.info(f"  Market: {ts_hms(next_ts)} → {ts_hms(next_ts+300)}   Orders @ {ts_hms(order_time)}")
+    log.info(f"  Market timestamp : {next_ts}  (new every 5 min)")
+    log.info(f"  PRE window : {ts_hms(order_time)} → {ts_hms(next_ts)}  (4 min)")
+    log.info(f"  LIVE window: {ts_hms(next_ts)} → {ts_hms(next_ts+300)}  (5 min)")
+    log.info(f"  Total monitor window: 9 min per cycle")
     log.info(f"{'─'*64}")
 
     # Sleep until order time
