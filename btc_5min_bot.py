@@ -167,10 +167,19 @@ def now_ts() -> int:
 def ts_hms(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S UTC")
 
-def next_market_start() -> int:
-    now = now_ts()
-    candidate = (now // 300) * 300 + 300
-    while candidate - PRE_MARKET_SECS < now:
+# Minimum setup time needed after a cycle ends before the next order window
+SETUP_BUFFER = 60  # seconds — time to fetch market, subscribe WS, etc.
+
+def next_market_start(after_ts: int = 0) -> int:
+    """
+    Return the next market start timestamp that gives us enough setup time.
+    Requires: order_time (= market_start - PRE_MARKET_SECS) >= after_ts + SETUP_BUFFER
+    i.e.:     market_start >= after_ts + PRE_MARKET_SECS + SETUP_BUFFER
+    """
+    base = after_ts if after_ts > 0 else now_ts()
+    candidate = (base // 300) * 300 + 300
+    # Need order_time at least SETUP_BUFFER seconds after we're free
+    while (candidate - PRE_MARKET_SECS) < (base + SETUP_BUFFER):
         candidate += 300
     return candidate
 
@@ -553,8 +562,8 @@ async def monitor(session: aiohttp.ClientSession, cycle_num: int, market: Market
 
 # ─── One cycle ─────────────────────────────────────────────────────────────────
 
-async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
-    next_ts    = next_market_start()
+async def run_cycle(session: aiohttp.ClientSession, cycle_num: int, free_after: int = 0):
+    next_ts    = next_market_start(free_after)
     order_time = next_ts - PRE_MARKET_SECS
 
     log.info("")
@@ -609,7 +618,7 @@ async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
                              start_ts=market.start_ts, skip_reason="placement failed")
         stats.record(result)
         await unsubscribe([market.up_token, market.down_token])
-        return
+        return market.end_ts
 
     # Monitor
     result = await monitor(session, cycle_num, market)
@@ -629,6 +638,7 @@ async def run_cycle(session: aiohttp.ClientSession, cycle_num: int):
     if gap > 0:
         log.info(f"  Waiting {gap}s for market to close...")
         await asyncio.sleep(gap + 2)
+    return market.end_ts
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
@@ -653,14 +663,18 @@ async def main():
     connector = aiohttp.TCPConnector(limit=10)
     async with aiohttp.ClientSession(connector=connector) as session:
         cycle = 1
+        free_after = 0   # 0 = use now for first cycle
         try:
             while True:
                 try:
-                    await run_cycle(session, cycle)
+                    result_end_ts = await run_cycle(session, cycle, free_after)
+                    # Pass the market end time so next cycle skips correctly
+                    free_after = result_end_ts if result_end_ts else 0
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     log.error(f"Cycle {cycle} error: {e}", exc_info=True)
+                    free_after = 0
                 cycle += 1
                 await asyncio.sleep(1)
         except (KeyboardInterrupt, asyncio.CancelledError):
