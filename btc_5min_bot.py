@@ -402,21 +402,34 @@ async def wait_for_market(session: aiohttp.ClientSession, ts: int) -> MarketInfo
 # ─── REST price fallback ────────────────────────────────────────────────────────
 
 async def fetch_prices_rest(session: aiohttp.ClientSession, market: MarketInfo):
-    """Fetch best bid/ask via REST /price endpoint (canonical per docs).
-    BUY price = best ask (lowest sell offer)
-    SELL price = best bid (highest buy offer)
+    """Fetch best bid/ask via REST.
+    Uses /book endpoint: bids sorted desc (bids[0]=best), asks sorted asc (asks[0]=best).
+    Cross-checks with /price: BUY=best ask, SELL=best bid.
     """
     for token, name in [(market.up_token, "UP"), (market.down_token, "DOWN")]:
         try:
-            buy_r, sell_r = await asyncio.gather(
-                http_get(session, f"{CLOB_API}/price", params={"token_id": token, "side": "BUY"}),
-                http_get(session, f"{CLOB_API}/price", params={"token_id": token, "side": "SELL"}),
-            )
-            ask = float(buy_r.get("price", 1.0))   # BUY price = best ask
-            bid = float(sell_r.get("price", 0.0))  # SELL price = best bid
+            # Primary: /book endpoint
+            book = await http_get(session, f"{CLOB_API}/book", params={"token_id": token})
+            raw_bids = book.get("bids", [])
+            raw_asks = book.get("asks", [])
+
+            # bids sorted descending → best bid = highest = first
+            # asks sorted ascending  → best ask = lowest = first
+            bid = float(raw_bids[0]["price"]) if raw_bids else 0.0
+            ask = float(raw_asks[0]["price"]) if raw_asks else 1.0
+
+            # Sanity check: if bid >= ask, the arrays might be reversed — use min/max
+            if bid >= ask and (raw_bids or raw_asks):
+                all_bid_prices = [float(x["price"]) for x in raw_bids]
+                all_ask_prices = [float(x["price"]) for x in raw_asks]
+                bid = max(all_bid_prices) if all_bid_prices else 0.0
+                ask = min(all_ask_prices) if all_ask_prices else 1.0
+                log.debug(f"  REST {name}: corrected inverted book → bid={bid:.4f} ask={ask:.4f}")
+
             prices.set(token, bid, ask)
-            empty = " ⚠ empty book" if bid <= 0.01 and ask >= 0.99 else ""
-            log.info(f"  REST {name}: bid={bid:.4f} ask={ask:.4f}{empty}")
+            empty = " ⚠ no liquidity" if bid <= 0.01 and ask >= 0.99 else ""
+            log.info(f"  REST {name}: bid={bid:.4f} ask={ask:.4f}  "
+                     f"(bids:{len(raw_bids)} asks:{len(raw_asks)}){empty}")
         except Exception as e:
             log.warning(f"  REST {name} failed: {e}")
 
@@ -483,16 +496,13 @@ async def monitor(session: aiohttp.ClientSession, cycle_num: int, market: Market
         up_bid,  up_ask  = prices.get(market.up_token)
         dn_bid,  dn_ask  = prices.get(market.down_token)
 
-        # Prices look like empty-book junk (0.01/0.99) — poll REST every 15s
-        # until real liquidity appears (ask < 0.90 means real quotes exist)
+        # Poll REST every 30s as backup — catches price moves WS misses
+        # Also polls aggressively when book looks empty (0.01/0.99)
         prices_stale = (up_ask >= 0.90 and dn_ask >= 0.90)
-        if prices_stale and now_ts() - last_rest_poll >= 15:
-            # After market goes LIVE with no prices — warn clearly
-            if now_ts() > market.start_ts and now_ts() - market.start_ts > 60:
-                log.warning(f"  ⚠ NO LIQUIDITY — market has been LIVE "
-                            f"{now_ts()-market.start_ts}s with no real quotes. "
-                            f"This cycle will likely end unfilled.")
-            log.info("  Prices stale — polling REST...")
+        poll_interval = 15 if prices_stale else 30
+        if now_ts() - last_rest_poll >= poll_interval:
+            if prices_stale and now_ts() > market.start_ts and now_ts() - market.start_ts > 60:
+                log.warning(f"  ⚠ No liquidity — LIVE {now_ts()-market.start_ts}s, no real quotes")
             await fetch_prices_rest(session, market)
             last_rest_poll = now_ts()
             up_bid, up_ask = prices.get(market.up_token)
