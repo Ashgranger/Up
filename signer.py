@@ -12,7 +12,7 @@ from utils import canonical, fmt, to_int
 class Signer:
     OP_PLACE, OP_CANCEL, OP_MODIFY = 1, 2, 3
     SIDE = {"BUY": 0, "SELL": 1}
-    TIF_ALO = 3
+    TIF_IOC, TIF_GTC, TIF_ALO = 1, 2, 3
 
     def __init__(self, key_hex: str, address: str, account_index: int):
         self.priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(key_hex))
@@ -40,15 +40,19 @@ class Signer:
         return {"type": req_type, "payload": body, "apiKey": self.api_key,
                 "timestamp": str(ts), "signature": self.priv.sign(message.encode()).hex()}
 
-    def place(self, m: Market, side: str, px: Decimal, qty: Decimal, good_til_us: int) -> dict:
+    def place(self, m: Market, side: str, px: Decimal, qty: Decimal, good_til_us: int,
+              time_in_force: str = "ALO", reduce_only: bool = False) -> dict:
         ts = self.next_ts()
+        tif_code = self.TIF_IOC if time_in_force == "IOC" else (self.TIF_GTC if time_in_force == "GTC" else self.TIF_ALO)
+        r_val = 1 if reduce_only else 0
+        order_type = "MARKET" if time_in_force == "MARKET" else "LIMIT"
         msg = self._typed(self.OP_PLACE, ts, m.market_id, g=good_til_us * 1000,
-                          p=to_int(px, m.tick), q=to_int(qty, m.step), r=0,
-                          s=self.SIDE[side], t=self.TIF_ALO)
+                          p=to_int(px, m.tick), q=to_int(qty, m.step), r=r_val,
+                          s=self.SIDE[side], t=tif_code)
         body = {"address": self.address, "accountIndex": self.ai, "marketId": m.market_id,
-                "orderSide": side, "orderType": "LIMIT", "timeInForce": "ALO",
+                "orderSide": side, "orderType": order_type, "timeInForce": time_in_force,
                 "goodTilTime": str(good_til_us), "quantity": fmt(qty), "price": fmt(px),
-                "timestamp": ts}
+                "reduceOnly": reduce_only, "timestamp": ts}
         return self._envelope("placeOrder", body, msg, ts)
 
     def cancel(self, m: Market, order_id: str) -> dict:

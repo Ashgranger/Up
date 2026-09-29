@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Arcus perp market maker (second bot + Level 4-7 quantitative features).
+"""Arcus perp market maker (Level 7 Quantitative Engine).
 
   python main.py                 # paper-trade (DRY_RUN=1): real market data, simulated fills, no orders
   python main.py --live          # send real post-only limit orders
@@ -20,7 +20,7 @@ log = logging.getLogger("main")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Arcus perp market maker")
+    ap = argparse.ArgumentParser(description="Arcus perp market maker (Level 7 Engine)")
     ap.add_argument("cmd", nargs="?", default="run", choices=["run", "scan"])
     ap.add_argument("--live", action="store_true", help="send real orders (overrides DRY_RUN=1)")
     ap.add_argument("--env", choices=["mainnet", "testnet"], help="override ARCUS_ENV")
@@ -54,13 +54,10 @@ def main() -> None:
         return
 
     from bot import MarketMaker
-    log.info("env=%s market=%s %s | order=$%s max_pos=$%s min_edge=%sbps skew=%sbps exit_profit=%sbps "
-             "stress=%sbps max_loss=$%s | L7: ev=%s(min %sbps) intel=%s learning=%s levels=%d",
-             cfg.env_name, cfg.market,
+    log.info("env=%s market=%s %s | order=$%s max_pos=$%s min_edge=%sbps skew=%sbps ladder_levels=%d "
+             "min_ev=%sbps tox_mult=%s", cfg.env_name, cfg.market,
              "PAPER (no orders sent)" if cfg.dry_run else "LIVE", cfg.order_usd, cfg.max_position_usd,
-             cfg.min_edge_bps, cfg.skew_bps, cfg.exit_min_profit_bps, cfg.stress_loss_bps,
-             cfg.session_max_loss_usd, cfg.enable_adaptive_ev, cfg.min_ev_bps, cfg.enable_orderbook_intel,
-             cfg.enable_online_learning, cfg.extra_levels)
+             cfg.min_edge_bps, cfg.skew_bps, cfg.extra_levels, cfg.min_ev_bps, cfg.tox_mult)
     if not cfg.dry_run and cfg.env_name == "mainnet":
         log.warning("LIVE ON MAINNET - real funds. Only post-only limit orders. Ctrl+C cancels all and exits.")
 
@@ -70,7 +67,7 @@ def main() -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, bot.stop_evt.set)
-            except NotImplementedError:  # Windows
+            except NotImplementedError:
                 signal.signal(sig, lambda *_: loop.call_soon_threadsafe(bot.stop_evt.set))
         await bot.run()
 

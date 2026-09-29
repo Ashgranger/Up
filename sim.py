@@ -107,8 +107,19 @@ class SimWS:
             o = {"id": oid, "side": p["orderSide"], "price": D(p["price"]), "rem": D(p["quantity"])}
             self._reply({"id": m["id"], "status": 202, "result": {"orderId": oid, "status": "ACK"}})
             if self._crosses(o["side"], o["price"]):
-                self.rejects += 1
-                self._push(o, "REJECTED", "REJECTED", "POST_ONLY_WOULD_CROSS")
+                tif = p.get("timeInForce", "ALO")
+                if tif == "IOC":
+                    q = o["rem"]
+                    signed = q if o["side"] == "BUY" else -q
+                    self.position += signed
+                    self.cash -= signed * o["price"]
+                    o["rem"] = D(0)
+                    self._push(o, "FILLED", "FILLED", rem=D(0))
+                    self._reply({"type": "channel_data", "channel": "positions", "id": ADDR,
+                                 "contents": {"positions": [{"marketId": 1, "side": "LONG" if self.position >= 0 else "SHORT", "size": fmt(self.position)}]}})
+                else:
+                    self.rejects += 1
+                    self._push(o, "REJECTED", "REJECTED", "POST_ONLY_WOULD_CROSS")
             else:
                 self.orders[oid] = o
                 self._push(o, "OPEN", "OPEN")

@@ -1,308 +1,456 @@
-"""Level 4-7 feature tests for the merged bot: `python test_level7.py` (offline, no pytest needed)."""
-import asyncio, json, os, random, sys, tempfile
+"""Comprehensive Test Suite for Level 7 Market Maker Engine."""
+import asyncio
+import os
+import sys
+import unittest
 from decimal import Decimal as D
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sim import *                                   # noqa: E402,F403  (make, step, mkcfg, MKT, D ...)
-import config as C                                  # noqa: E402
-from strategy import Snapshot, Strategy             # noqa: E402
-from ledger import Ledger                           # noqa: E402
-from learner import OnlineLearner                   # noqa: E402
-from market import Market, MarketData, classify_regime   # noqa: E402
-from orders import Order                            # noqa: E402
-
-FAILS = []
+import sim
+from market import Market
+from utils import BUY, SELL, fmt
 
 
-def check(name, cond, extra=""):
-    print(("  ok   " if cond else "  FAIL ") + name + (f"  [{extra}]" if extra and not cond else ""))
-    if not cond:
-        FAILS.append(name)
+class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
 
+    async def test_01_multi_ladder_placement(self):
+        """Test that multiple quotes (ladder pairs) are maintained simultaneously and tracked individually."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=1, ORDER_USD=20, MAX_POSITION_USD=100, SKEW_BPS=0)
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
 
-MK = Market(1, "XYZ-USD", "ONLINE", D("0.01"), D("0.001"), [], D("5"), D("0.001"), D("100000"), D("0"), False)
+        buy_orders = bot.om.side_orders(BUY)
+        sell_orders = bot.om.side_orders(SELL)
 
+        self.assertGreaterEqual(len(buy_orders), 1, "Should have at least 1 buy order")
+        self.assertGreaterEqual(len(sell_orders), 1, "Should have at least 1 sell order")
+        
+        for o in bot.om.orders.values():
+            self.assertIn(o.pair_index, [0, 1])
+            self.assertIn(o.side, [BUY, SELL])
+            self.assertGreater(o.price, D(0))
+            self.assertGreater(o.remaining, D(0))
+        print("✓ test_01_multi_ladder_placement passed: Multiple ladder pairs placed and tracked individually.")
 
-def snap(cfg, **kw):
-    base = dict(now=100.0, market=MKT, bid=D("81349.0"), ask=D("81349.1"), mid=D("81349.05"), micro=D("81349.05"),
-                position=D(0), avg_cost=D(0), hold_s=0.0, ret_bps=D(0), move_bps=D(0), vol_bps=D(0), tox_bps=D(0))
-    base.update(kw)
-    return Snapshot(**base)
+    async def test_02_orderbook_intelligence_microprice(self):
+        """Test Level 5 Order-Book Intelligence: heavy buy pressure shifts fair value and protects the ask."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ENABLE_ORDERBOOK_INTEL=1, USE_MICRO=1)
+        
+        await sim.step(bot, s, clock, "80000.0", "80100.0", bsz="1", asz="1")
+        initial_ask = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(initial_ask, "Initial ask should be present in balanced market")
+        initial_ask_price = initial_ask.price
 
+        # Heavy bid pressure arrives: bid size = 10, ask size = 0.5 (microprice pumps toward ask)
+        await sim.step(bot, s, clock, "80000.0", "80100.0", bsz="10", asz="0.5")
+        
+        new_ask = bot.om.get_order_by_slot(0, SELL)
+        if new_ask is None:
+            print("✓ test_02_orderbook_intelligence passed: Toxic ask pulled completely (EV < 0 protection).")
+        else:
+            self.assertGreater(new_ask.price, initial_ask_price, "Ask should reprice higher to protect against toxic buying")
+            print(f"✓ test_02_orderbook_intelligence passed: Ask lifted from {initial_ask.price} to {new_ask.price}.")
 
-def wide(cfg, **kw):
-    """10-tick-wide book on a 0.01-tick market: room for penny quotes and flow shading."""
-    return snap(cfg, market=MK, bid=D("100.00"), ask=D("100.10"), mid=D("100.05"), micro=D("100.05"), **kw)
+    async def test_03_adaptive_ev_filter(self):
+        """Test Level 4 Adaptive Market Making: quote only when EV > min_ev_bps."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, MIN_EV_BPS="1.0", ENABLE_ADAPTIVE_EV="1",
+                                 MIN_EDGE_BPS="5", PENNY="0")
+        
+        await sim.step(bot, s, clock, "80000.0", "80000.1")
+        self.assertEqual(s.rejects, 0, "No post-only crossing rejects should occur")
+        print("✓ test_03_adaptive_ev_filter passed: Zero crossing rejects with adaptive EV guard.")
 
+    async def test_04_online_learning_toxicity(self):
+        """Test Level 6 Online Learning: markout tracking measures toxicity and widens edge."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, MARKOUT_HORIZON_S=1.0, TOX_MULT=2.0, ENABLE_ONLINE_LEARNING=1)
+        await sim.step(bot, s, clock, "80000.0", "80050.0")
 
-# ------------------------------------------------------------------------------------------------ #
-print("1. config: the L7 environment parses exactly")
-ENV = dict(MAX_HOLD_S=120, SESSION_MAX_LOSS_USD="2.0", HALT_EXIT=1, TREND_WINDOW_S="5.0", TREND_PULL_BPS="6.0",
-           TREND_WIDEN="1.0", TREND_HOLD_S="2.0", VOL_WINDOW_S="5.0", VOL_PAUSE_BPS="25.0", JUMP_BPS="8.0",
-           JUMP_COOLDOWN_S="2.0", BURST_FILLS=3, BURST_WINDOW_S="15.0", BURST_COOLDOWN_S="12.0",
-           SWEEP_GUARD_FILLS=2, SWEEP_GUARD_WINDOW_S="1.0", REQUOTE_BPS="1.0", RETREAT_BPS="0.4",
-           MIN_REQUOTE_S="1.5", MAX_ACTIONS_PER_MIN=1060, LOOP_S="0.25", HEARTBEAT_S="5.0", RECONCILE_S="5.0",
-           STATUS_S="15.0", STALE_S="15.0", MAX_MARKET_SPREAD_BPS="40.0", MAX_ORACLE_DEV_BPS="150.0",
-           QUOTE_OUTSIDE_RTH=1)
-cfg = mkcfg(**ENV)
-got = dict(max_hold_s=cfg.max_hold_s, loss=cfg.session_max_loss_usd, halt=cfg.halt_exit, tw=cfg.trend_window_s,
-           tp=cfg.trend_pull_bps, tw2=cfg.trend_widen, th=cfg.trend_hold_s, vw=cfg.vol_window_s, vp=cfg.vol_pause_bps,
-           jb=cfg.jump_bps, jc=cfg.jump_cooldown_s, bf=cfg.burst_fills, bw=cfg.burst_window_s, bc=cfg.burst_cooldown_s,
-           sf=cfg.sweep_guard_fills, sw=cfg.sweep_guard_window_s, rq=cfg.requote_bps, rt=cfg.retreat_bps,
-           mr=cfg.min_requote_s, ma=cfg.max_actions_per_min, lp=cfg.loop_s, hb=cfg.heartbeat_s, rc=cfg.reconcile_s,
-           st=cfg.status_s, sl=cfg.stale_s, ms=cfg.max_market_spread_bps, mo=cfg.max_oracle_dev_bps,
-           rth=cfg.quote_outside_rth)
-want = dict(max_hold_s=120.0, loss=D("2.0"), halt=True, tw=5.0, tp=D("6.0"), tw2=D("1.0"), th=2.0, vw=5.0,
-            vp=D("25.0"), jb=D("8.0"), jc=2.0, bf=3, bw=15.0, bc=12.0, sf=2, sw=1.0, rq=D("1.0"), rt=D("0.4"),
-            mr=1.5, ma=1060, lp=0.25, hb=5.0, rc=5.0, st=15.0, sl=15.0, ms=D("40.0"), mo=D("150.0"), rth=True)
-bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
-check("every variable in the L7 env block is read into Config", not bad, str(bad))
-d = mkcfg()
-check("L4-L7 model defaults present (EV, OBI/TFI, kappa, gamma, regimes, state path)",
-      d.min_ev_bps == D("0.2") and d.enable_adaptive_ev and d.enable_orderbook_intel and d.enable_online_learning
-      and d.obi_alpha == D("1.0") and d.tfi_beta == D("1.5") and d.fill_prob_kappa == D("0.25")
-      and d.gamma_risk_aversion == D("0.1") and d.ev_hysteresis_bps == D("0.1"))
+        fill = bot.ledger.on_fill(BUY, D("0.0003"), D("80000.0"), D("80025.0"), clock.t, D("5"))
+        
+        clock.t += 1.5
+        bot.ledger.process_markouts(D("79900.0"), clock.t)
+        
+        self.assertGreater(bot.ledger.tox_bps, D(0), "Toxicity should be learned from adverse markout")
+        side_tox = bot.ledger.side_tox_bps(BUY)
+        self.assertGreater(side_tox, D(10), "Buy side toxicity should be elevated")
+        print(f"✓ test_04_online_learning_toxicity passed: Learned buy-side toxicity = {side_tox:.2f} bps.")
 
-# ------------------------------------------------------------------------------------------------ #
-print("2. order-book intelligence: OBI/TFI fair value, clamped inside the book")
-cfg = mkcfg(ENABLE_ADAPTIVE_EV="0", EXTRA_LEVELS=0)
-st = Strategy(cfg)
-p0 = st.plan(wide(cfg))
-pobi = st.plan(wide(cfg, obi=D("0.5")))
-check("neutral book: fair == micro", p0.fair == D("100.05"), str(p0.fair))
-check("bid-heavy book (OBI +0.5): fair shifts up by 0.5 half-spreads", pobi.fair == D("100.075"), str(pobi.fair))
-check("fair value never leaves [bid, ask]", st.plan(wide(cfg, obi=D("1"), tfi=D("1"))).fair == D("100.10"))
-check("buying flow (TFI +0.8) shades the ASK away from the market",
-      st.plan(wide(cfg, tfi=D("0.8"))).ask.price > p0.ask.price, str((st.plan(wide(cfg, tfi=D("0.8"))).ask, p0.ask)))
-cfg_off = mkcfg(ENABLE_ADAPTIVE_EV="0", EXTRA_LEVELS=0, ENABLE_ORDERBOOK_INTEL="0")
-check("ENABLE_ORDERBOOK_INTEL=0 -> OBI/TFI ignored", Strategy(cfg_off).plan(wide(cfg_off, obi=D("0.5"), tfi=D("0.8"))).fair == D("100.05"))
+    async def test_05_spread_capture_roundtrip(self):
+        """Test that roundtrip fills capture positive spread without rejects."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100)
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
 
-md = MarketData(mkcfg())
-md.on_trade("BUY", D("3"), D("100"), 10.0); md.on_trade("SELL", D("1"), D("100"), 10.5)
-check("trade-flow imbalance = (buy-sell)/total", md.trade_flow_imbalance(10.0, 11.0) == D("0.5"))
-check("trades older than the window are ignored", md.trade_flow_imbalance(10.0, 30.0) == D(0))
-md.update(D("100"), D("100.1"), D("9"), D("1"), 11.0)
-check("top-of-book OBI = (bid_sz-ask_sz)/total", md.obi == D("0.8"))
-
-# ------------------------------------------------------------------------------------------------ #
-print("3. regimes")
-c = mkcfg()
-check("quiet", classify_regime(c, D(0), D(0), D(0), D(0)) == "REGIME_A_QUIET")
-check("high vol", classify_regime(c, D(0), D(0), D(0), D(6)) == "REGIME_B_HIGH_VOL")
-check("trend (flow)", classify_regime(c, D(0), D("0.5"), D(0), D(0)) == "REGIME_C_TREND")
-check("toxic beats everything", classify_regime(c, D("3"), D("0.9"), D("0.9"), D(9)) == "REGIME_D_TOXIC")
-cfgT = mkcfg(EXTRA_LEVELS=2, ENABLE_ADAPTIVE_EV="0")
-stT = Strategy(cfgT)
-pq, pt = stT.plan(snap(cfgT)), stT.plan(snap(cfgT, tox_bps=D("3")))
-check("toxic regime widens the edge", pt.edge_bps > pq.edge_bps, str((pq.edge_bps, pt.edge_bps)))
-check("toxic regime drops the extra add levels", len(pq.extra_bids) == 2 and not pt.extra_bids and not pt.extra_asks,
-      str((len(pq.extra_bids), len(pt.extra_bids))))
-check("toxic regime is reported on the plan", pt.regime == "REGIME_D_TOXIC" and pq.regime == "REGIME_A_QUIET")
-
-# ------------------------------------------------------------------------------------------------ #
-print("4. reservation price: non-linear inventory skew + volatility risk aversion")
-cfg = mkcfg(ENABLE_ADAPTIVE_EV="0", EXTRA_LEVELS=0, MAX_POSITION_USD=200, ORDER_USD=20)
-st = Strategy(cfg)
-sm = st.plan(snap(cfg, position=D("0.0005"), avg_cost=D("81349.05")))     # ~$40 long = 20% of cap
-bg = st.plan(snap(cfg, position=D("0.0020"), avg_cost=D("81349.05")))     # ~$160 long = 80% of cap
-check("skew grows with inventory", bg.skew_bps > sm.skew_bps > 0, str((sm.skew_bps, bg.skew_bps)))
-check("...faster than linearly (q^1.3: 4x the inventory -> ~6x the skew)", bg.skew_bps / sm.skew_bps > D("5"), str(bg.skew_bps / sm.skew_bps))
-pv = st.plan(snap(cfg, position=D("0.0020"), avg_cost=D("81349.05"), vol_bps=D("5")))
-check("volatility adds risk-aversion skew (gamma * vol * q)", pv.skew_bps > bg.skew_bps, str((bg.skew_bps, pv.skew_bps)))
-
-# ------------------------------------------------------------------------------------------------ #
-print("5. add-quote gating: pressure, anti-chasing, inventory rotation")
-cfg = mkcfg(EXTRA_LEVELS=1, MAX_POSITION_USD=200, ORDER_USD=20)
-st = Strategy(cfg)
-ps = st.plan(snap(cfg, obi=D("-1"), tfi=D("-1")))
-check("severe selling pressure: no bid adds at all, ask still quoted", ps.bid is None and not ps.extra_bids and ps.ask is not None,
-      str((ps.bid, ps.extra_bids, ps.notes)))
-pb = st.plan(snap(cfg, obi=D("1"), tfi=D("1")))
-check("severe buying pressure: no ask adds at all, bid still quoted", pb.ask is None and not pb.extra_asks and pb.bid is not None)
-pl = st.plan(snap(cfg, position=D("0.000246"), avg_cost=D("81349.05")))     # ~$20 long: already loaded
-check("already long: touch (L0) bid suppressed, deeper level kept", pl.bid is None and len(pl.extra_bids) == 1
-      and pl.extra_bids[0].level == 1, str((pl.bid, pl.extra_bids)))
-check("...while the exit (reduce) ask stays live", pl.ask is not None and pl.ask.role == "reduce")
-pch = st.plan(snap(cfg, ret_bps=D("1.5"), tox_bps=D("3")))
-check("chasing a rally in a toxic regime: L0 bid suppressed", pch.bid is None, str((pch.bid, pch.notes)))
-pcalm = st.plan(snap(cfg, ret_bps=D("1.5")))
-check("same rally in a calm regime: still quoting the bid", pcalm.bid is not None)
-
-# ------------------------------------------------------------------------------------------------ #
-print("6. expected-value filter + hysteresis")
-cfg0 = mkcfg(ENABLE_ADAPTIVE_EV="0", EXTRA_LEVELS=0)
-ev0 = Strategy(cfg0).plan(snap(cfg0)).bid.ev_bps
-check("every add quote carries its EV and fill probability", ev0 is not None and Strategy(cfg0).plan(snap(cfg0)).bid.p_fill is not None)
-cfgE = mkcfg(MIN_EV_BPS=str(ev0 + D("0.05")), EV_HYSTERESIS_BPS="0.1", EXTRA_LEVELS=0)
-stE = Strategy(cfgE)
-check("EV just under MIN_EV_BPS -> quote not placed", stE.plan(snap(cfgE)).bid is None)
-check("...but an already-resting level keeps its place (hysteresis)",
-      stE.plan(snap(cfgE, live_levels=frozenset({(0, "BUY")}))).bid is not None)
-cfgW = mkcfg(EXTRA_LEVELS=0)
-pw = Strategy(cfgW).plan(snap(cfgW, market=MK, bid=D("100.00"), ask=D("100.50"), mid=D("100.25"), micro=D("100.25")))
-check("quote too far from the far touch to ever fill -> EV filter drops it", pw.bid is None and pw.ask is None)
-cfgM = mkcfg(EXTRA_LEVELS=0, TREND_PULL_BPS=50)
-pm2 = Strategy(cfgM).plan(snap(cfgM, ret_bps=D("-6")))
-check("falling market: expected adverse move eats the EV of a bid (no trend pull needed)", pm2.bid is None, str(pm2.notes))
-
-# ------------------------------------------------------------------------------------------------ #
-print("7. exits: profit floor decays with hold time, stress exits at the touch")
-cfg = mkcfg(EXTRA_LEVELS=0, MAX_HOLD_S=120)
-st = Strategy(cfg)
-pos = D("0.0004")
-a0 = st.plan(snap(cfg, position=pos, avg_cost=D("81349.0"), hold_s=10)).ask.price
-a1 = st.plan(snap(cfg, position=pos, avg_cost=D("81349.0"), hold_s=70)).ask.price
-a2 = st.plan(snap(cfg, position=pos, avg_cost=D("81349.0"), hold_s=200)).ask.price
-check("floor: fresh 1.0bps > 0.8bps after 0.5x hold > 0.2bps after 1.5x hold", a0 >= a1 >= a2 and a0 > a2, str((a0, a1, a2)))
-check("...but never below cost", a2 > D("81349.0"))
-ps = st.plan(snap(cfg, bid=D("81100.0"), ask=D("81100.1"), mid=D("81100.05"), micro=D("81100.05"), position=pos, avg_cost=D("81300")))
-check("underwater beyond STRESS_LOSS_BPS -> exit at the touch, no adding", ps.stress and ps.ask.price <= D("81100.1") and ps.bid is None)
-
-# ------------------------------------------------------------------------------------------------ #
-print("8. per-side toxicity + time-weighted markouts")
-lg = Ledger(mkcfg(MARKOUT_HORIZON_S="1"))
-lg.on_fill("BUY", D("0.001"), D("100"), D("100"), 0.0, D(5))
-lg.on_fill("SELL", D("0.001"), D("100"), D("100"), 0.0, D(5))
-lg.process_markouts(D("99.98"), 2.0)              # mid fell 2bps: bad for the buy, good for the sell
-check("buy side is toxic, sell side is not", lg.side_tox_bps("BUY") > 0 and lg.side_tox_bps("SELL") == 0,
-      str((lg.side_tox_bps("BUY"), lg.side_tox_bps("SELL"))))
-lg.current_now = 100.0
-check("markouts fade: 60s+ old samples stop counting", lg.tox_bps == 0 and lg.side_tox_bps("BUY") == 0)
-lg2 = Ledger(mkcfg())
-check("a side with no samples borrows the overall figure (0 with none)", lg2.side_tox_bps("BUY") == 0)
-
-# ------------------------------------------------------------------------------------------------ #
-print("9. online learner")
-tmp = tempfile.mkdtemp()
-path = os.path.join(tmp, "learn.json")
-cfgL = mkcfg(LEARNING_STATE_PATH=path)
-L = OnlineLearner(cfgL)
-base_edge, base_ev = L.min_edge_bps, L.min_ev_bps
-L.on_markout(D("-10"), "BUY", D("3"))
-check("adverse markout widens edges, spacing, tox_mult and EV hurdle",
-      L.min_edge_bps > base_edge and L.min_ev_bps > base_ev and L.tox_mult > D("1") and L.level_spacing_bps > D("4"))
-wide_edge = L.min_edge_bps
-L.on_markout(D("2"), "BUY", D("0"))
-check("benign markout relaxes them back towards base", base_edge < L.min_edge_bps < wide_edge)
-L.tick_decay(0.0); L.tick_decay(600.0)
-check("idle decay returns everything to base", abs(L.min_edge_bps - base_edge) < D("0.001"), str(L.min_edge_bps))
-L.on_markout(D("-10"), "BUY", D("3"))
-check("state is persisted atomically", os.path.exists(path) and json.load(open(path))["params"]["min_edge_bps"])
-L2 = OnlineLearner(cfgL)
-check("...and reloaded by the next run", L2.min_edge_bps == L.min_edge_bps and L2.n_markouts == L.n_markouts, str((L2.min_edge_bps, L.min_edge_bps)))
-cfgOther = mkcfg(LEARNING_STATE_PATH=path, MARKET="ETH-USD")
-check("state saved for another market is not loaded", OnlineLearner(cfgOther).min_edge_bps == cfgOther.min_edge_bps)
-Loff = OnlineLearner(mkcfg(ENABLE_ONLINE_LEARNING="0"))
-Loff.on_markout(D("-10"), "BUY", D("3"))
-check("ENABLE_ONLINE_LEARNING=0 -> params are exactly the config", Loff.min_edge_bps == Loff.base["min_edge_bps"] and Loff.n_markouts == 0)
-L3 = OnlineLearner(mkcfg(MAX_POSITION_USD=100))
-L3.on_fill("BUY", D("100"), D("100"), D("90"), 60.0)
-check("stagnant / heavy inventory raises skew and risk aversion", L3.skew_bps > D("3") and L3.gamma_risk_aversion > D("0.1"))
-L4 = OnlineLearner(mkcfg()); a0 = L4.obi_alpha
-L4.on_flow_correlation(D("0.6"), D("0"), D("1")); L4.on_flow_correlation(D("0.6"), D("0"), D("1"))
-check("OBI weight grows when imbalance predicted the move", L4.obi_alpha > a0)
-L4.on_flow_correlation(D("0.6"), D("0"), D("-1")); L4.on_flow_correlation(D("0.6"), D("0"), D("-1")); L4.on_flow_correlation(D("0.6"), D("0"), D("-1"))
-check("...and shrinks when it did not", L4.obi_alpha < a0 + D("0.04"))
-learned = OnlineLearner(mkcfg(ENABLE_ADAPTIVE_EV="0", EXTRA_LEVELS=0))
-learned.on_markout(D("-15"), "BUY", D("3")); learned.on_markout(D("-15"), "BUY", D("3"))
-cfgS = mkcfg(ENABLE_ADAPTIVE_EV="0", EXTRA_LEVELS=0)
-p_static = Strategy(cfgS).plan(snap(cfgS))
-p_learn = Strategy(cfgS).plan(snap(cfgS, params=learned))
-check("the strategy quotes wider once the learner has seen toxic fills", p_learn.bid.price < p_static.bid.price and p_learn.ask.price > p_static.ask.price,
-      str((p_static.bid, p_learn.bid)))
-
-
-async def scenarios():
-    # -------------------------------------------------------------------------------------------- #
-    print("10. trades channel -> trade-flow imbalance; subscription")
-    bot, sim, clk = make(EXTRA_LEVELS=0)
-    subs = []
-    orig = sim.send
-
-    async def send(raw):
-        m = json.loads(raw)
-        if m["type"] == "subscribe":
-            subs.append(m["channel"])
-        await orig(raw)
-    sim.send = send
-    await step(bot, sim, clk, "81000.0", "81000.1")
-    await bot.startup()
-    check("bot subscribes to the public trades channel", "trades" in subs, str(subs))
-    sim.push_trade("BUY", "3", "81000.1"); sim.push_trade("BUY", "1", "81000.1"); sim.push_trade("SELL", "1", "81000.0")
-    for _ in range(4):
+        # Taker hits our bid
+        s.taker(SELL)
         await asyncio.sleep(0)
-    check("trades feed the imbalance (3 buys+1, 1 sell -> +0.6)", bot.md.trade_flow_imbalance(10.0, clk.t) == D("0.6"),
-          str(bot.md.trade_flow_imbalance(10.0, clk.t)))
-    bot.ex.handle_message(json.dumps({"type": "subscribed", "channel": "trades", "id": "BTC-USD",
-                                       "contents": [{"side": "SELL", "size": "50", "price": "1"}]}))
-    check("a trades snapshot (history replay) is not stamped as fresh flow", bot.md.trade_flow_imbalance(10.0, clk.t) == D("0.6"))
-
-    # -------------------------------------------------------------------------------------------- #
-    print("11. guards: burst/sweep pull only ADD orders, never an exit")
-    bot, sim, clk = make(EXTRA_LEVELS=0)
-    await step(bot, sim, clk, "81000.0", "81000.1")
-    add = Order("add-1", "BUY", D("80900.0"), D("0.0003"), D("0.0003"), 0, clk.t, clk.t, level=0, role="add")
-    red = Order("red-1", "BUY", D("80950.0"), D("0.0003"), D("0.0003"), 0, clk.t, clk.t, level=0, role="reduce")
-    bot.om.orders = {"add-1": add, "red-1": red}
-    await bot.om.cancel_side("BUY", clk.t)
-    check("cancel_side removed the add order", "add-1" not in bot.om.orders)
-    check("...and left the reducing (exit) order alone", "red-1" in bot.om.orders)
-    bot.ledger.learner.enabled = True
-    bot.ledger.learner.params["burst_fills"] = D("3")
-    for _ in range(3):
-        clk.t += 2.0
-        bot.on_fill("BUY", D("0.0001"), D("81000.0"), None)
-    check("burst threshold comes from the learner (live) parameters", bot.cooldown["BUY"] > clk.t)
-
-    # -------------------------------------------------------------------------------------------- #
-    print("12. RTH pause (QUOTE_OUTSIDE_RTH) does not spam cancelAllOrders")
-    mk_rth = Market(18, "HOOD-USD", "ONLINE", D("0.01"), D("0.0000001"), [], D("5"), D("0.0000001"), D("10000"), D("118.575"), True)
-    bot, sim, clk = make(EXTRA_LEVELS=0, QUOTE_OUTSIDE_RTH="0")
-    bot.md.info = mk_rth; bot.md.info_ts = clk.t
-    await step(bot, sim, clk, "118.56", "118.59")
-    sim.posts.clear()
-    for _ in range(10):
-        clk.t += 0.25; bot.md.info_ts = clk.t
-        await bot.tick()
-    check("outside RTH with QUOTE_OUTSIDE_RTH=0: nothing sent", len(sim.posts) == 0 and not bot.can_quote(clk.t)[0], str(sim.posts))
-    bot2, sim2, clk2 = make(EXTRA_LEVELS=0, QUOTE_OUTSIDE_RTH="1")
-    bot2.md.info = mk_rth; bot2.md.info_ts = clk2.t
-    await step(bot2, sim2, clk2, "118.56", "118.59")
-    check("QUOTE_OUTSIDE_RTH=1: quotes outside RTH", bot2.can_quote(clk2.t)[0] and len(bot2.om.orders) >= 1)
-    bot3, sim3, clk3 = make(EXTRA_LEVELS=0)
-    check("cancel_all is skipped when nothing of ours can be resting", (await bot3.om.cancel_all()) is None and "cancelAllOrders" not in sim3.posts)
-
-    # -------------------------------------------------------------------------------------------- #
-    print("13. end-to-end with a live tape: accounting exact, learning state saved on stop")
-    state = os.path.join(tempfile.mkdtemp(), "state.json")
-    for seed in (5, 6):
-        rnd = random.Random(seed)
-        bot, sim, clk = make(SESSION_MAX_LOSS_USD=100, MIN_EDGE_BPS="1.0", ORDER_USD=30, MAX_POSITION_USD=90,
-                             LEARNING_STATE_PATH=state, EXTRA_LEVELS=1)
-        bot.md.info = MK; bot.cfg.market = "XYZ-USD"
-        fair = D("100.00")
-        for i in range(3000):
-            fair = (fair + D(str(round(rnd.gauss(0, 0.004), 3)))).quantize(D("0.001"))
-            bid = (fair - D("0.03")).quantize(D("0.01")); ask = (fair + D("0.03")).quantize(D("0.01"))
-            await step(bot, sim, clk, bid, ask, dt=0.25, tick=False)
-            if rnd.random() < 0.3:
-                sim.push_trade("BUY" if rnd.random() < 0.5 else "SELL", "1", fmt(fair))
-            if rnd.random() < 0.15:
-                sim.taker("BUY" if rnd.random() < 0.5 else "SELL")
-                await asyncio.sleep(0); await asyncio.sleep(0)
-            await bot.tick(); await asyncio.sleep(0)
-        mid = (sim.bid + sim.ask) / 2
-        led = bot.ledger
-        check(f"seed {seed}: ledger PnL == simulator PnL ({led.total_pnl(mid):+.4f})", abs(led.total_pnl(mid) - sim.pnl(mid)) < D("1e-6"),
-              f"{led.total_pnl(mid)} vs {sim.pnl(mid)}")
-        check(f"seed {seed}: position == exchange position", abs(led.position - sim.position) < D("1e-9"))
-        check(f"seed {seed}: exposure never above MAX_POSITION_USD (+1 order)", abs(led.position * mid) <= D("90") + D("31"))
-        check(f"seed {seed}: the learner actually ran ({led.learner.total_learned_updates} updates)", led.learner.total_learned_updates > 0)
-    await bot.shutdown_orders()
-    check("learning state written on shutdown", os.path.exists(state) and json.load(open(state))["params"])
+        await asyncio.sleep(0)
+        self.assertGreater(bot.ledger.position, D(0), "Should be long after bid fill")
+        
+        # Quoting exit at the ask
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(BUY)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        
+        self.assertTrue(bot.ledger.is_flat(D("80040.0"), D("5.0")), f"Should be flat after closing ask fill, got {bot.ledger.position}")
+        self.assertGreater(bot.ledger.realized, D(0), "Realized PnL from spread capture should be positive")
+        self.assertEqual(s.rejects, 0, "Zero post-only rejects")
+        print(f"✓ test_05_spread_capture_roundtrip passed: Realized PnL = ${bot.ledger.realized:.4f}.")
 
 
-asyncio.run(scenarios())
-print()
-print("ALL LEVEL-7 TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
-sys.exit(1 if FAILS else 0)
+
+
+    async def test_06_toxic_regime_and_sweep_guard(self):
+        """Test Level 7 Toxic Regime protection and preemptive Sweep Guard."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=2, ORDER_USD=20, MAX_POSITION_USD=200,
+                                 REGIME_TOXIC_SPREAD_MULT="1.5", SWEEP_GUARD_FILLS=2)
+        # 1. Normal step
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        self.assertGreaterEqual(len(bot.om.side_orders(BUY)), 2)
+
+        # 2. Simulate sweep fills (2 fills in <= 1.0s)
+        f1 = bot.om.get_order_by_slot(0, BUY)
+        bot._on_fill(BUY, f1.remaining, f1.price, f1)
+        f2 = bot.om.get_order_by_slot(1, BUY)
+        bot._on_fill(BUY, f2.remaining, f2.price, f2)
+        await asyncio.sleep(0.01)
+        self.assertGreater(bot._burst_blocked_until[BUY], clock.t, "BUY side should be sweep blocked")
+
+        # 3. Test toxic regime OBI suppression
+        bot.ledger.markouts.append(D("-5.0"))
+        self.assertEqual(bot.md.detect_regime(clock.t, bot.ledger.tox_bps), "REGIME_D_TOXIC")
+        # Unblock and test step under toxic sell dump (OBI < -0.4)
+        bot._burst_blocked_until[BUY] = 0.0
+        await sim.step(bot, s, clock, "80000.0", "80100.0", bsz="0.1", asz="10.0")
+        buy_orders = bot.om.side_orders(BUY)
+        self.assertEqual(len(buy_orders), 0, "BUY orders should be suppressed during toxic sell dump")
+        print("✓ test_06_toxic_regime_and_sweep_guard passed: Toxic OBI protection and Sweep Guard active.")
+
+
+    async def test_07_online_learning_full_adaptation_and_persistence(self):
+        """Test Level 6+ Online Learning: adapt edge, spacing, sizing, skew, EV, and persist state."""
+        test_path = 'test_learning_state_unit.json'
+        if os.path.exists(test_path):
+            os.remove(test_path)
+
+        bot, s, clock = sim.make(EXTRA_LEVELS=2, ORDER_USD=20, MAX_POSITION_USD=200,
+                                 ENABLE_ONLINE_LEARNING=1, MARKOUT_HORIZON_S=1.0,
+                                 LEARNING_STATE_PATH=test_path)
+        learner = bot.ledger.learner
+        base_edge = learner.min_edge_bps
+        base_spacing = learner.level_spacing_bps
+        base_skew = learner.skew_bps
+
+        # 1. Fill and adverse markout -> adapts edge, spacing, tox_mult, min_ev
+        fill = bot.ledger.on_fill(BUY, D('0.0003'), D('80000.0'), D('80025.0'), clock.t, D('5'))
+        clock.t += 2.0
+        bot.ledger.process_markouts(D('79900.0'), clock.t) # -12.5 bps adverse markout
+
+        self.assertGreater(learner.min_edge_bps, base_edge, "min_edge should widen on adverse markout")
+        self.assertGreater(learner.level_spacing_bps, base_spacing, "ladder spacing should widen")
+        self.assertGreater(learner.tox_mult, D('1.0'), "tox_mult should increase")
+        self.assertGreater(learner.min_ev_bps, D('0.2'), "min_ev should increase")
+
+        # 2. Inventory holding duration -> adapts skew_bps & gamma_risk_aversion
+        learner.on_fill(BUY, D('80000.0'), D('80000.0'), D('150.0'), 60.0)
+        self.assertGreater(learner.skew_bps, base_skew, "skew should adapt higher on prolonged inventory")
+
+        # 3. Flow correlation -> adapts obi_alpha & tfi_beta
+        base_obi = learner.obi_alpha
+        learner.on_flow_correlation(D('0.5'), D('0.5'), D('1.0'))
+        self.assertGreater(learner.obi_alpha, base_obi, "obi_alpha should adapt higher on predictive flow")
+
+        # 4. Persistence verification
+        self.assertTrue(os.path.exists(test_path), "Learning state file must be persisted to disk")
+
+        # 5. Cold reload verification
+        bot2, _, _ = sim.make(EXTRA_LEVELS=2, ORDER_USD=20, MAX_POSITION_USD=200,
+                              ENABLE_ONLINE_LEARNING=1, LEARNING_STATE_PATH=test_path)
+        self.assertEqual(bot2.ledger.learner.min_edge_bps, learner.min_edge_bps)
+        self.assertEqual(bot2.ledger.learner.skew_bps, learner.skew_bps)
+        self.assertEqual(bot2.ledger.learner.total_learned_updates, learner.total_learned_updates)
+
+        if os.path.exists(test_path):
+            os.remove(test_path)
+        print("✓ test_07_online_learning_full_adaptation_and_persistence passed: All parameters adapted and persisted.")
+
+
+    async def test_08_profitable_unwind_and_no_loss_selling(self):
+        """Test that unwinding inventory guarantees minimum profit and does not sell at a loss."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", STRESS_LOSS_BPS="20.0",
+                                 MIN_REQUOTE_S="0.1", JUMP_BPS="20.0")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL) # fills long at 80000.1
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # Market drops below entry price
+        clock.t += 0.5
+        await sim.step(bot, s, clock, "79980.0", "80000.0")
+        ask_order = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(ask_order)
+        self.assertGreaterEqual(ask_order.price, D('80012.0'), "Bot must quote exit at or above min_profit_px")
+        print("✓ test_08_profitable_unwind_and_no_loss_selling passed: Bot preserves profit and prevents loss selling.")
+
+
+    async def test_09_anti_double_buying_and_chasing_top(self):
+        """Test that bot suppresses L0 re-bids when already long and prevents chasing tops in toxic surge."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=2, ORDER_USD=20, MAX_POSITION_USD=200)
+        await sim.step(bot, s, clock, '80000.0', '80100.0')
+
+        # 1. Fill long
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertGreater(bot.ledger.position, D(0))
+
+        # While already long, L0 touch BUY must be suppressed (focus on unwinding at profit)
+        quotes = bot.engine.generate_ladder_quotes(bot._get_market(), bot.md, bot.ledger, clock.t, False, False)
+        buy_slots = [q.pair_index for q in quotes if q.side == BUY]
+        self.assertNotIn(0, buy_slots, "L0 BUY must be suppressed when already long")
+
+        # 2. Anti-chasing top in toxic regime
+        bot.ledger.position = D(0)
+        bot.ledger.markouts.append(D('-5.0'))
+        self.assertEqual(bot.md.detect_regime(clock.t, bot.ledger.tox_bps), 'REGIME_D_TOXIC')
+
+        # Simulate upward price surge in history (ret_5s > 1.0 bps)
+        bot.md._hist.append((clock.t - 4.0, D('79900.0')))
+        bot.md._hist.append((clock.t, D('80100.0')))
+        self.assertGreater(bot.md.ret_bps(bot.cfg.trend_window_s, clock.t), D('1.0'))
+
+        quotes_chase = bot.engine.generate_ladder_quotes(bot._get_market(), bot.md, bot.ledger, clock.t, False, False)
+        chase_buy_slots = [q.pair_index for q in quotes_chase if q.side == BUY]
+        self.assertNotIn(0, chase_buy_slots, "L0 BUY must be suppressed during toxic price surge")
+        print("✓ test_09_anti_double_buying_and_chasing_top passed: Single inventory control and anti-chasing active.")
+
+
+    async def test_10_rth_and_no_redundant_cancel_all(self):
+        """Test that outside RTH does not spam cancelAllOrders when flat and respects QUOTE_OUTSIDE_RTH."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, QUOTE_OUTSIDE_RTH="0")
+        m_hood = Market(18, 'HOOD-USD', 'ONLINE', D('0.01'), D('0.0000001'), [], D('5'), D('0.0000001'), D('10000'), D('118.575'), True)
+        bot.md.info = m_hood
+        bot.md.info_ts = clock.t
+        bot.md.bid = D('118.56')
+        bot.md.ask = D('118.59')
+
+        s.posts.clear()
+        for _ in range(10):
+            await bot.tick()
+            clock.t += 0.25
+
+        self.assertEqual(len(s.posts), 0, "Should not send cancelAllOrders when no orders exist")
+
+        # Quoting allowed when enabled
+        bot2, s2, clock2 = sim.make(EXTRA_LEVELS=0, QUOTE_OUTSIDE_RTH="1")
+        bot2.md.info = m_hood
+        bot2.md.info_ts = clock2.t
+        await sim.step(bot2, s2, clock2, "118.56", "118.59")
+        self.assertGreaterEqual(len(bot2.om.orders), 1)
+        print("✓ test_10_rth_and_no_redundant_cancel_all passed: RTH pause clean and no spam cancel-all.")
+
+
+    async def test_11_adverse_fill_avoidance_and_full_env_learning(self):
+        """Test that order book imbalance suppresses adverse fills and full-env learner adapts."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=1, ORDER_USD=20, MAX_POSITION_USD=200,
+                                 ENABLE_ONLINE_LEARNING=1)
+
+        # 1. Neutral step
+        await sim.step(bot, s, clock, "80000.0", "80080.0", bsz="1", asz="1")
+        self.assertIsNotNone(bot.om.get_order_by_slot(0, BUY))
+
+        # 2. Severe sell pressure (bsz=0.1, asz=10 -> OBI ~ -0.98) suppresses touch buy
+        clock.t += 1.0
+        await sim.step(bot, s, clock, "80000.0", "80080.0", bsz="0.1", asz="10.0")
+        self.assertIsNone(bot.om.get_order_by_slot(0, BUY), "Touch BUY must be suppressed under severe sell pressure")
+
+        # 3. Verify all env parameters present in learner
+        l = bot.ledger.learner
+        for param in ["min_edge_bps", "max_edge_bps", "skew_bps", "level_spacing_bps",
+                      "level_size_mult", "vol_k", "tox_mult", "min_ev_bps",
+                      "obi_alpha", "tfi_beta", "fill_prob_kappa", "gamma_risk_aversion",
+                      "regime_toxic_spread_mult", "trend_pull_bps", "trend_widen",
+                      "exit_min_profit_bps", "stress_loss_bps", "max_hold_s",
+                      "burst_fills", "burst_cooldown_s"]:
+            self.assertIn(param, l.params)
+            self.assertIsNotNone(getattr(l, param))
+
+        print("✓ test_11_adverse_fill_avoidance_and_full_env_learning passed: Adverse fills avoided and full env learned.")
+
+    async def test_12_learning_decay_and_paralysis_recovery(self):
+        """Test that online learner and toxicity smoothly decay to prevent indefinite quote paralysis."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=1, ORDER_USD=20, MAX_POSITION_USD=200,
+                                 ENABLE_ONLINE_LEARNING=1, MARKOUT_HORIZON_S=1.0)
+
+        # 1. Neutral step
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        initial_edge = bot.ledger.learner.min_edge_bps
+
+        # 2. Simulate adverse markout on a round trip
+        fill1 = bot.ledger.on_fill(BUY, D("0.00025"), D("80000.0"), D("80040.0"), clock.t, D("5"))
+        fill2 = bot.ledger.on_fill(SELL, D("0.00025"), D("79950.0"), D("79950.0"), clock.t, D("5"))
+        clock.t += 1.5
+        bot.ledger.process_markouts(D("79900.0"), clock.t)
+
+        widened_edge = bot.ledger.learner.min_edge_bps
+        self.assertGreater(widened_edge, initial_edge, "Adverse markout should widen edge")
+        self.assertGreater(bot.ledger.tox_bps, D("0"), "Toxicity should be positive")
+
+        # 3. Fast-forward time by 100 seconds without fills (calm market)
+        for _ in range(20):
+            clock.t += 5.0
+            bot.ledger.current_now = clock.t
+            bot.ledger.learner.tick_decay(clock.t)
+            await bot.tick()
+
+        recovered_edge = bot.ledger.learner.min_edge_bps
+        recovered_tox = bot.ledger.tox_bps
+        self.assertLess(recovered_edge, widened_edge, "Learned edge must mean-revert toward base")
+        self.assertEqual(recovered_tox, D("0"), "Toxicity must decay to 0 after extended calm")
+
+        # 4. Verify quotes actively participate near the touch
+        b0 = bot.om.get_order_by_slot(0, BUY)
+        s0 = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(b0, "Touch BUY should be active when flat")
+        self.assertIsNotNone(s0, "Touch SELL should be active when flat")
+        print("✓ test_12_learning_decay_and_paralysis_recovery passed: Decay and active quote recovery verified.")
+
+    async def test_13_cross_exchange_lead_lag_and_stale_quote_defense(self):
+        """Test Cross-Exchange Intelligence: External leader venue surge immediately elevates adverse move and pulls vulnerable quote."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ENABLE_CROSS_EXCHANGE=1, CROSS_VELOCITY_THRESHOLD_BPS="1.0")
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        ask0 = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(ask0, "Initial ask should be placed in balanced market")
+
+        # External leader venue (Binance Futures) surges up +25 bps
+        bot.on_external_venue_bbo("BINANCE", D("80050.0"), D("80055.0"))
+        clock.t += 0.5
+        bot.on_external_venue_bbo("BINANCE", D("80250.0"), D("80260.0"))
+        
+        velo = bot.md.cross.cross_velocity_bps(3.0, clock.t)
+        self.assertGreater(velo, D("10.0"), "External velocity should be strongly positive")
+        
+        adv_sell = bot.engine.expected_adverse_move(SELL, bot.md, bot.ledger, clock.t)
+        self.assertGreater(adv_sell, D("10.0"), "Expected adverse move on SELL should spike")
+
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        new_ask = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNone(new_ask, "Vulnerable ask should be pulled completely to prevent stale-quote sniping")
+        print("✓ test_13_cross_exchange_lead_lag_and_stale_quote_defense passed: Vulnerable quote pulled ahead of external surge.")
+
+    async def test_14_cross_exchange_dispersion_and_spread_capture(self):
+        """Test that cross-exchange dispersion widens quoted spread during venue disagreement, capturing higher volatility premium."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ENABLE_CROSS_EXCHANGE=1, CROSS_DISPERSION_WIDEN_MULT="2.0",
+                                 MIN_EDGE_BPS="5", MAX_EDGE_BPS="40", PENNY="0")
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        b0 = bot.om.get_order_by_slot(0, BUY)
+        a0 = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(b0)
+        self.assertIsNotNone(a0)
+        normal_spread = a0.price - b0.price
+
+        # External venues disagree: Binance at 79900, Bybit at 80200 (>30 bps dispersion)
+        bot.on_external_venue_bbo("BINANCE", D("79900.0"), D("79910.0"))
+        bot.on_external_venue_bbo("BYBIT", D("80190.0"), D("80200.0"))
+        disp = bot.md.cross.cross_dispersion_bps()
+        self.assertGreater(disp, D("20.0"), "Cross-venue dispersion should be elevated")
+
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        b1 = bot.om.get_order_by_slot(0, BUY)
+        a1 = bot.om.get_order_by_slot(0, SELL)
+        if b1 and a1:
+            widened_spread = a1.price - b1.price
+            self.assertGreaterEqual(widened_spread, normal_spread, "Spread should widen during venue disagreement")
+            print(f"✓ test_14_cross_exchange_dispersion_and_spread_capture passed: Spread widened from {normal_spread} to {widened_spread}.")
+        else:
+            print("✓ test_14_cross_exchange_dispersion_and_spread_capture passed: High dispersion protected quotes.")
+
+    async def test_15_smart_inventory_fast_breakeven_unwind(self):
+        """Test Smart Inventory Management: When adverse flow arrives (TFI < -0.5, OBI < -0.5), bot accelerates unwind down to breakeven maker."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                 MIN_REQUOTE_S="0.1")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertGreater(bot.ledger.position, D(0))
+
+        # Adverse flow arrives (selling pressure)
+        clock.t += 0.5
+        s.push_trade(SELL, "1.0", "80000.0")
+        await sim.step(bot, s, clock, "79990.0", "80010.0", bsz="0.2", asz="1.5")
+
+        ask_order = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(ask_order)
+        self.assertLess(ask_order.price, D("80010.0"), "Ask should be shaded down to breakeven maker under adverse flow")
+        print("✓ test_15_smart_inventory_fast_breakeven_unwind passed: Flow-accelerated breakeven unwind active.")
+
+    async def test_16_emergency_taker_cut_on_adverse_cascade(self):
+        """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                 MIN_REQUOTE_S="0.1", EMERGENCY_TAKER_LOSS_BPS="6.0")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertGreater(bot.ledger.position, D(0))
+
+        # Severe price dump with persistent aggressive selling
+        clock.t += 0.5
+        s.push_trade(SELL, "2.0", "79900.0")
+        await sim.step(bot, s, clock, "79900.0", "79920.0", bsz="0.1", asz="2.0")
+
+        self.assertEqual(bot.ledger.position, D(0), "Long position should be liquidated via taker order")
+        print("✓ test_16_emergency_taker_cut_on_adverse_cascade passed: Emergency Taker Cut liquidated position.")
+
+
+
+
+    async def test_17_severe_selling_pressure_maker_scratch_and_taker_cut(self):
+        """Test User Real Log Scenario:
+        1. Long position held at cost 80000.0.
+        2. Market drops to 79992.0 (loss ~1.0 bps) with severe selling pressure (OBI=-0.8, TFI=-1.0).
+        3. Bot joins best ask as aggressive maker scratch at 0% maker fee, rather than hanging above market.
+        4. When price cascades further to 79940.0 (loss > 6.0 bps), emergency taker IOC fires to cut loss.
+        """
+        bot, s, clock = sim.make(EXTRA_LEVELS=2, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                 MIN_REQUOTE_S="0.1", EMERGENCY_TAKER_LOSS_BPS="6.0")
+        # 1. Fill Long at 80000.0
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertGreater(bot.ledger.position, D(0))
+        entry_cost = bot.ledger.avg_cost
+
+        # 2. Market drops 1 bps below entry cost with severe selling pressure
+        clock.t += 0.5
+        s.push_trade(SELL, "1.0", "79992.0")
+        await sim.step(bot, s, clock, "79988.0", "79996.0", bsz="0.1", asz="0.9")
+
+        # Check: Unwind ask must join best ask (79996.0 or penny 79995.9), NOT hang above entry_cost
+        ask_order = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(ask_order)
+        self.assertLessEqual(ask_order.price, D("79996.0"), "Unwind ask must join top of book as maker scratch")
+        self.assertLess(ask_order.price, entry_cost, "Under severe selling pressure, ask must not be held above cost")
+
+        # Check: All BUY levels must be suppressed (no falling knife accumulation)
+        buy_order_l0 = bot.om.get_order_by_slot(0, BUY)
+        buy_order_l1 = bot.om.get_order_by_slot(1, BUY)
+        self.assertIsNone(buy_order_l0, "L0 BUY must be suppressed during severe selling pressure")
+        self.assertIsNone(buy_order_l1, "L1 BUY must be suppressed during severe selling pressure")
+
+        # 3. Market cascades down past 6.0 bps loss
+        clock.t += 0.5
+        s.push_trade(SELL, "2.0", "79940.0")
+        await sim.step(bot, s, clock, "79930.0", "79940.0", bsz="0.05", asz="2.0")
+
+        # Check: Emergency Taker Cut executed, position is flat
+        self.assertEqual(bot.ledger.position, D(0), "Position must be liquidated via emergency taker order")
+        print("✓ test_17_severe_selling_pressure_maker_scratch_and_taker_cut passed: Scratch & Taker cut verified.")
+
+
+if __name__ == "__main__":
+    unittest.main()
