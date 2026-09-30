@@ -73,6 +73,7 @@ class SimWS:
         self.rejects = 0
         self.posts = []
         self.max_open_per_side = 0
+        self.ioc_orders = []
 
     def _reply(self, obj):
         asyncio.get_running_loop().call_soon(self.bot.ex.handle_message, json.dumps(obj))
@@ -106,20 +107,27 @@ class SimWS:
             oid = f"sim-{self.seq}"
             o = {"id": oid, "side": p["orderSide"], "price": D(p["price"]), "rem": D(p["quantity"])}
             self._reply({"id": m["id"], "status": 202, "result": {"orderId": oid, "status": "ACK"}})
+            if p.get("timeInForce") == "IOC":
+                self.ioc_orders.append(dict(p))
+                touch = self.bid if o["side"] == "SELL" else self.ask
+                ok = (o["side"] == "SELL" and touch >= o["price"]) or (o["side"] == "BUY" and touch <= o["price"])
+                q = o["rem"]
+                if p.get("reduceOnly"):
+                    q = min(q, abs(self.position)) if ((o["side"] == "SELL") == (self.position > 0)) else D(0)
+                if not ok or q <= 0:
+                    self._push(o, "REJECTED", "REJECTED", "IOC_CANCELED")
+                    return
+                signed = q if o["side"] == "BUY" else -q
+                self.position += signed
+                self.cash -= signed * touch
+                o["price"], o["rem"] = touch, D(0)
+                self._push(o, "FILLED", "FILLED", rem=D(0))
+                self._reply({"type": "channel_data", "channel": "positions", "id": ADDR,
+                             "contents": {"positions": [{"marketId": 1, "side": "LONG" if self.position >= 0 else "SHORT", "size": fmt(self.position)}]}})
+                return
             if self._crosses(o["side"], o["price"]):
-                tif = p.get("timeInForce", "ALO")
-                if tif == "IOC":
-                    q = o["rem"]
-                    signed = q if o["side"] == "BUY" else -q
-                    self.position += signed
-                    self.cash -= signed * o["price"]
-                    o["rem"] = D(0)
-                    self._push(o, "FILLED", "FILLED", rem=D(0))
-                    self._reply({"type": "channel_data", "channel": "positions", "id": ADDR,
-                                 "contents": {"positions": [{"marketId": 1, "side": "LONG" if self.position >= 0 else "SHORT", "size": fmt(self.position)}]}})
-                else:
-                    self.rejects += 1
-                    self._push(o, "REJECTED", "REJECTED", "POST_ONLY_WOULD_CROSS")
+                self.rejects += 1
+                self._push(o, "REJECTED", "REJECTED", "POST_ONLY_WOULD_CROSS")
             else:
                 self.orders[oid] = o
                 self._push(o, "OPEN", "OPEN")

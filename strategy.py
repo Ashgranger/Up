@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional
 
+import inventory
 from learner import OnlineLearner
 from market import Market, classify_regime
 from utils import BPS, BUY, SELL, ZERO, ONE, Fatal, bps_diff, clamp, q_down, q_up
@@ -59,6 +60,7 @@ class Snapshot:
     sell_tox_bps: Optional[Decimal] = None
     params: Any = None                  # OnlineLearner (or None -> static config values)
     live_levels: frozenset = frozenset()     # {(level, side)} currently resting (EV hysteresis)
+    severe_latched: dict = field(default_factory=lambda: {BUY: False, SELL: False})   # bot-held pressure latch
 
 
 @dataclass
@@ -87,6 +89,8 @@ class Plan:
     extra_asks: list = field(default_factory=list)
     regime: str = "REGIME_A_QUIET"
     fair: Decimal = ZERO
+    inv: Any = None                       # inventory.InvDecision (state, risk, taker cut request, ...)
+    severe: dict = field(default_factory=lambda: {BUY: False, SELL: False})   # raw severe-pressure flags
 
 
 class Strategy:
@@ -139,6 +143,19 @@ class Strategy:
         flow_bias = Decimal("0.6") * obi + Decimal("0.4") * tfi
         half_spr = spread / Decimal(2)
 
+        # ---- inventory manager: risk-scored exit aggressiveness (uses every signal we have) ------
+        buy_tox0 = s.buy_tox_bps if s.buy_tox_bps is not None else s.tox_bps
+        sell_tox0 = s.sell_tox_bps if s.sell_tox_bps is not None else s.tox_bps
+        inv = inventory.assess(
+            c, P, position=s.position, avg_cost=s.avg_cost, bid=s.bid, ask=s.ask, mid=mid, hold_s=s.hold_s,
+            ret_bps=s.ret_bps, vol_bps=s.vol_bps, obi=obi, tfi=tfi,
+            imb=clamp(s.imbalance, -ONE, ONE) if c.use_depth_imbalance else ZERO,
+            side_tox_bps=(buy_tox0 if long_ else sell_tox0), flat=flat, halted=s.halted)
+        if inv.state != inventory.NORMAL:
+            notes.append(f"inventory {inv.state} risk={inv.risk:.2f} flow_against={inv.flow_against:+.2f} "
+                         f"pnl={inv.pnl_bps:+.1f}bps exit gives up {inv.give_bps:.2f}bps")
+            floor_bps = floor_bps - inv.give_bps           # may go below zero: accept a small loss to get out
+
         # ---- regime, fair value, reservation price --------------------------------------------
         vol = s.vol_bps
         regime = classify_regime(c, s.tox_bps, tfi, obi, vol)
@@ -180,8 +197,12 @@ class Strategy:
 
         chasing_top = s.ret_bps > Decimal("0.8") and (toxic or flow_bias > Decimal("0.3"))
         chasing_bottom = s.ret_bps < Decimal("-0.8") and (toxic or flow_bias < Decimal("-0.3"))
-        severe_sell_pressure = flow_bias < Decimal("-0.50") or (toxic and obi < Decimal("-0.55"))
-        severe_buy_pressure = flow_bias > Decimal("0.50") or (toxic and obi > Decimal("0.55"))
+        raw_sev_sell = flow_bias < Decimal("-0.50") or (toxic and obi < Decimal("-0.55"))
+        raw_sev_buy = flow_bias > Decimal("0.50") or (toxic and obi > Decimal("0.55"))
+        # the bot latches these for SEVERE_HOLD_S so a value flickering around the threshold does not
+        # cancel/re-place the side every tick
+        severe_sell_pressure = raw_sev_sell or s.severe_latched.get(BUY, False)
+        severe_buy_pressure = raw_sev_buy or s.severe_latched.get(SELL, False)
 
         # multi-level depth pressure (leading), on top of the OBI/TFI model above: only ever the
         # ADD side is widened/shrunk, never the exit
@@ -206,8 +227,11 @@ class Strategy:
             return qty >= m.min_size and qty * px >= m.min_notional and (not m.max_size or qty <= m.max_size)
 
         def reduce_qty() -> Decimal:
-            qty = abs(s.position) if stress else min(abs(s.position), base)
-            return q_down(qty, m.step)
+            if stress:
+                qty = abs(s.position)
+            else:
+                qty = max(min(abs(s.position), base), abs(s.position) * inv.reduce_frac)
+            return q_down(min(qty, abs(s.position)), m.step)
 
         # ---- guards for ADDING sides --------------------------------------------------------
         def blocked(side: str) -> tuple:
@@ -271,6 +295,9 @@ class Strategy:
             if (not buy) and severe_buy_pressure:
                 why_not.append("severe buying pressure")
                 return None
+            if same_dir and inv.block_adds:
+                why_not.append(f"inventory {inv.util:.0%} of cap / risk {inv.risk:.2f}: no more adds this way")
+                return None
             if k == 0:
                 loaded = (pos_usd >= c.order_usd * Decimal("0.5")) if buy else (-pos_usd >= c.order_usd * Decimal("0.5"))
                 chasing = chasing_top if buy else chasing_bottom
@@ -320,7 +347,7 @@ class Strategy:
                     return None
             if px <= 0:
                 return None
-            scale = ONE - Decimal("0.5") * abs(q) if same_dir else ONE      # smaller when loaded
+            scale = (ONE - Decimal("0.5") * abs(q)) * inv.add_scale if same_dir else ONE      # smaller when loaded
             usd = c.order_usd * scale * (bid_imb_mult if buy else ask_imb_mult) * (P.level_size_mult ** k)
             usd = max(usd, m.min_notional)
             qty = q_down(usd / px, m.step)
@@ -468,4 +495,4 @@ class Strategy:
         bid, extra_bids = split(bid_t)
         ask, extra_asks = split(ask_t)
         return Plan(bid, ask, edge, inv_skew_bps, stress, notes, blocked_map, extra_bids, extra_asks,
-                    regime=regime, fair=fair)
+                    regime=regime, fair=fair, inv=inv, severe={BUY: raw_sev_sell, SELL: raw_sev_buy})

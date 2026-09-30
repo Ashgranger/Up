@@ -15,3 +15,10 @@ Behaviour changes to know about
 - .env.example has your L7 values (SESSION_MAX_LOSS_USD=2.0, MAX_ACTIONS_PER_MIN=1060, QUOTE_OUTSIDE_RTH=1, ...).
   Credentials are NOT included: copy to .env and fill in.
 Tests: python test_bot.py ; python test_level7.py
+
+## Inventory manager + taker cut (added after the L7 merge)
+inventory.py scores position risk from OBI/TFI/depth imbalance/trend/tox/vol/size/hold time. Rising risk -> maker exit slides
+toward the touch and works more of the position (50% at PRESSURE, 100% at STRESS), same-direction adds are blocked/shrunk.
+A taker cut is an IOC + reduce-only LIMIT (Arcus: t=2, r=1) with a bounded price, sent only when expected further loss beats
+half-spread + 2.2bps fee (after INV_MAKER_WAIT_S), or on a hard stop / emergency. ENABLE_TAKER_EXIT=0 disables it entirely.
+Tests: python test_inventory.py

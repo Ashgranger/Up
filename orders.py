@@ -1,4 +1,8 @@
-"""Order book of *our own* orders with Multi-Pair Individual Order Management."""
+"""Order book of *our own* orders. Nothing rests on the exchange that this class doesn't know about.
+
+Sources of truth, in order: place ACK -> `orders` channel updates -> periodic `get orders` reconcile
+(ghosts are dropped, unknown orders are cancelled). All orders are LIMIT + ALO (post-only).
+"""
 from __future__ import annotations
 
 import json
@@ -7,21 +11,20 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Callable, Optional, Dict, Tuple, List
+from typing import Callable, Optional
 
 from exchange import Exchange
 from market import Market
 from signer import Signer
-from utils import BUY, SELL, fmt, bps_diff
+from utils import BUY, SELL, fmt
 
 log = logging.getLogger("orders")
-GTT_DAYS = 40
+GTT_DAYS = 40  # goodTilTime must be >= ~1 month ahead on EVERY order (docs)
 
 
 @dataclass
 class Order:
     order_id: str
-    pair_index: int
     side: str
     price: Decimal
     qty: Decimal
@@ -31,7 +34,8 @@ class Order:
     last_action: float
     filled_any: bool = False
     cancelling_since: Optional[float] = None
-    is_taker: bool = False
+    level: int = 0            # 0 = touch quote, 1+ = ladder level (tagged so each fill can be analysed by level)
+    role: str = ""            # "add" | "reduce"
 
 
 class OrderManager:
@@ -40,40 +44,44 @@ class OrderManager:
         self.cfg, self.ex, self.signer = cfg, ex, signer
         self.get_market = get_market
         self.on_fill = on_fill
-        
         self.orders: dict[str, Order] = {}
-        self.pair_slots: dict[Tuple[int, str], str] = {}
-        self._unmatched: dict[str, tuple] = {}
+        self._unmatched: dict[str, tuple] = {}       # updates that beat their own ACK
+        self._recently_closed: deque = deque(maxlen=200)   # (ts, order_id): never "orphan-cancel" these
         self.reject_until = {BUY: 0.0, SELL: 0.0}
         self._reject_n = {BUY: 0, SELL: 0}
         self._actions: deque = deque()
         self.paused_until = 0.0
-        self._recently_closed: deque = deque(maxlen=200)
         self._consec_errors = 0
         self.last_place_ts = 0.0
-        self.maybe_orders = True
+        self.maybe_orders = True   # unknown leftovers (previous run) -> clean slate at start
         self.n_place = self.n_modify = self.n_cancel = self.n_reject = self.n_actions = 0
 
-    def side_orders(self, side: str) -> list[Order]:
-        return sorted((o for o in self.orders.values() if o.side == side), key=lambda o: o.price, reverse=(side == BUY))
+    # ---- views ------------------------------------------------------------ #
+    def side_orders(self, side: str) -> list:
+        return sorted((o for o in self.orders.values() if o.side == side and o.role != "take"),
+                      key=lambda o: o.created)
 
-    def get_order_by_slot(self, pair_index: int, side: str) -> Optional[Order]:
-        oid = self.pair_slots.get((pair_index, side))
-        return self.orders.get(oid) if oid else None
+    def live_levels(self) -> frozenset:
+        """{(level, side)} of every resting order (feeds the strategy's EV hysteresis)."""
+        return frozenset((o.level, o.side) for o in self.orders.values()
+                         if o.cancelling_since is None and o.role != "take")
+
+    def _forget(self, order_id: str) -> None:
+        """Drop an order from our book and remember it briefly, so a slightly stale `get orders`
+        that still lists it is not mistaken for an unknown orphan."""
+        if self.orders.pop(order_id, None) is not None:
+            self._recently_closed.append((time.time(), order_id))
 
     def open_qty(self, side: str) -> Decimal:
-        return sum((o.remaining for o in self.orders.values() if o.side == side), Decimal(0))
+        return sum((o.remaining for o in self.orders.values() if o.side == side and o.role != "take"), Decimal(0))
 
     def describe(self, now: float) -> str:
         if not self.orders:
             return "none"
-        desc = []
-        for (pair_idx, side), oid in sorted(self.pair_slots.items()):
-            o = self.orders.get(oid)
-            if o:
-                desc.append(f"L{pair_idx}{'B' if side == BUY else 'S'} {fmt(o.remaining)}@{fmt(o.price)}")
-        return " | ".join(desc) if desc else "none"
+        return " | ".join(f"{'B' if o.side == BUY else 'S'} {fmt(o.remaining)}@{fmt(o.price)} ({now - o.created:.0f}s)"
+                          for o in sorted(self.orders.values(), key=lambda o: o.side))
 
+    # ---- helpers ------------------------------------------------------------ #
     def _budget(self, now: float) -> bool:
         while self._actions and now - self._actions[0] > 60:
             self._actions.popleft()
@@ -104,48 +112,70 @@ class OrderManager:
         self._reject_n[side] += 1
         self.reject_until[side] = now + min(0.25 * 2 ** (self._reject_n[side] - 1), 4.0)
 
-    async def place(self, pair_index: int, side: str, px: Decimal, qty: Decimal, now: float,
-                    time_in_force: str = "ALO", reduce_only: bool = False) -> Optional[Order]:
+    # ---- actions -------------------------------------------------------------- #
+    async def place(self, side: str, px: Decimal, qty: Decimal, now: float,
+                    level: int = 0, role: str = "") -> Optional[Order]:
         if now < self.paused_until or not self._budget(now):
             return None
         good_til = int(time.time() * 1_000_000) + GTT_DAYS * 86_400 * 1_000_000
-        req = self.signer.place(self.get_market(), side, px, qty, good_til,
-                                time_in_force=time_in_force, reduce_only=reduce_only)
+        req = self.signer.place(self.get_market(), side, px, qty, good_til)
         self.maybe_orders = True
         self.last_place_ts = now
         resp = await self.ex.write(req)
         res = resp.get("result") or {}
         if not self._ok(resp) or not res.get("orderId") or str(res.get("status")).upper() == "REJECTED":
-            self._error(f"place L{pair_index} {side}", resp if not self._ok(resp) else
+            self._error(f"place {side}", resp if not self._ok(resp) else
                         {"status": resp.get("status"), "error": res}, now)
             self._backoff(side, now)
             return None
         self._consec_errors = 0
         self.n_place += 1
-        oid = str(res["orderId"])
-        o = Order(oid, pair_index, side, px, qty, qty, good_til, now, now, is_taker=(time_in_force == "IOC"))
-        self.orders[oid] = o
-        self.pair_slots[(pair_index, side)] = oid
-        log.info("PLACE L%d %s %s @ %s", pair_index, side, fmt(qty), fmt(px))
-        early = self._unmatched.pop(oid, None)
+        o = Order(res["orderId"], side, px, qty, qty, good_til, now, now, level=level, role=role)
+        self.orders[o.order_id] = o
+        log.info("PLACE %s %s @ %s", side, fmt(qty), fmt(px))
+        early = self._unmatched.pop(o.order_id, None)
+        if early:
+            self._apply(o, early[1], now)
+        return o
+
+    async def take(self, side: str, px_limit: Decimal, qty: Decimal, now: float) -> Optional[Order]:
+        """Bounded taker cut: IOC + reduce-only LIMIT at `px_limit` (worst acceptable price). Bypasses the
+        requote budget on purpose - getting out of a losing position must not queue behind quote churn -
+        but still honours a 429 pause."""
+        if now < self.paused_until:
+            return None
+        good_til = int(time.time() * 1_000_000) + GTT_DAYS * 86_400 * 1_000_000
+        req = self.signer.place_ioc(self.get_market(), side, px_limit, qty, good_til, reduce_only=True)
+        self.n_actions += 1
+        resp = await self.ex.write(req)
+        res = resp.get("result") or {}
+        if not self._ok(resp) or not res.get("orderId") or str(res.get("status")).upper() == "REJECTED":
+            self._error(f"take {side}", resp if not self._ok(resp) else {"status": resp.get("status"), "error": res}, now)
+            return None
+        self._consec_errors = 0
+        self.n_place += 1
+        o = Order(res["orderId"], side, px_limit, qty, qty, good_til, now, now, level=0, role="take")
+        self.orders[o.order_id] = o
+        log.warning("TAKE %s %s IOC limit %s (reduce-only)", side, fmt(qty), fmt(px_limit))
+        early = self._unmatched.pop(o.order_id, None)
         if early:
             self._apply(o, early[1], now)
         return o
 
     async def modify(self, o: Order, px: Decimal, now: float, urgent: bool = False) -> bool:
         if now < self.paused_until or not self._budget(now):
-            if urgent:
+            if urgent:                       # can't afford a reprice while running from the market -> pull it
                 await self.cancel(o, now)
             return False
         req = self.signer.modify(self.get_market(), o.order_id, o.side, px, o.qty, o.good_til_us)
         resp = await self.ex.write(req)
         if not self._ok(resp):
-            self._error(f"modify L{o.pair_index} {o.side}", resp, now)
-            await self.cancel(o, now)
+            self._error(f"modify {o.side}", resp, now)
+            await self.cancel(o, now)   # unknown state -> pull it, re-place cleanly
             return False
         self._consec_errors = 0
         self.n_modify += 1
-        log.info("MODIFY L%d %s %s -> %s", o.pair_index, o.side, fmt(o.price), fmt(px))
+        log.info("MODIFY %s %s -> %s", o.side, fmt(o.price), fmt(px))
         o.price, o.last_action = px, now
         return True
 
@@ -153,90 +183,41 @@ class OrderManager:
         if o.cancelling_since is not None and now - o.cancelling_since < 5:
             return
         o.cancelling_since = now
-        self._recently_closed.append((now, o.order_id))
+        self._recently_closed.append((time.time(), o.order_id))
         self._budget(now)
         resp = await self.ex.write(self.signer.cancel(self.get_market(), o.order_id))
         if self.cfg.dry_run or "ORDER_NOT_FOUND" in json.dumps(resp):
-            self._remove_order(o.order_id)
+            self._forget(o.order_id)
         elif not self._ok(resp):
             o.cancelling_since = None
-            self._error(f"cancel L{o.pair_index} {o.side}", resp, now)
+            self._error(f"cancel {o.side}", resp, now)
         else:
-            self.n_cancel += 1
+            self.n_cancel += 1   # the CANCELED order update removes it
 
-    def _remove_order(self, order_id: str) -> None:
-        o = self.orders.pop(order_id, None)
-        if o:
-            self._recently_closed.append((time.time(), order_id))
-            slot = (o.pair_index, o.side)
-            if self.pair_slots.get(slot) == order_id:
-                self.pair_slots.pop(slot, None)
-
-    async def cancel_side(self, side: str, now: float) -> None:
-        for slot, oid in list(self.pair_slots.items()):
-            if slot[1] == side:
-                o = self.orders.get(oid)
-                if o:
-                    await self.cancel(o, now)
+    async def cancel_side(self, side: str, now: float, adds_only: bool = True) -> None:
+        """Pull a side immediately (burst / sweep guards). By default only ADD-role orders: an exit
+        that happens to sit on that side must stay live so the position can always be unwound."""
+        for o in list(self.orders.values()):
+            if o.side == side and o.role != "take" and (not adds_only or o.role != "reduce"):
+                await self.cancel(o, now)
 
     async def cancel_all(self, force: bool = False) -> None:
         if not force and not self.orders and not self.maybe_orders:
-            return
+            return                      # nothing of ours can be resting -> don't spam cancelAllOrders
         m = self.get_market()
         body = {"address": self.cfg.address, "accountIndex": self.cfg.account_index, "marketId": m.market_id}
         resp = await self.ex.write(self.signer.legacy("cancelAllOrders", body))
         log.info("CANCEL-ALL sent (status %s)", resp.get("status"))
         self.orders.clear()
-        self.pair_slots.clear()
         self.maybe_orders = False
 
-    async def sync_quotes(self, targets: list, now: float, blocked_sides: Optional[set] = None) -> None:
-        active_slots = set()
-        
-        for t in targets:
-            slot = (t.pair_index, t.side)
-            active_slots.add(slot)
-            existing = self.get_order_by_slot(t.pair_index, t.side)
-            
-            if getattr(t, "is_taker", False):
-                if existing:
-                    await self.cancel(existing, now)
-                await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                                 time_in_force="IOC", reduce_only=True)
-                continue
-
-            if existing is None:
-                if now >= self.reject_until[t.side]:
-                    await self.place(t.pair_index, t.side, t.price, t.qty, now)
-            else:
-                drift = abs(bps_diff(t.price, existing.price))
-                is_advancing = (t.side == BUY and t.price > existing.price) or (t.side == SELL and t.price < existing.price)
-                is_retreating = not is_advancing
-                
-                should_modify = False
-                urgent = False
-                if is_retreating and drift >= self.cfg.retreat_bps:
-                    should_modify = True
-                    urgent = True
-                elif is_advancing and drift >= self.cfg.requote_bps and (now - existing.last_action >= self.cfg.min_requote_s):
-                    should_modify = True
-
-                if should_modify:
-                    await self.modify(existing, t.price, now, urgent=urgent)
-
-        for slot, oid in list(self.pair_slots.items()):
-            if slot not in active_slots:
-                o = self.orders.get(oid)
-                if o:
-                    await self.cancel(o, now)
-
+    # ---- inbound order updates ---------------------------------------------------- #
     def on_update(self, c, now: float) -> None:
         if not isinstance(c, dict) or not c.get("orderId"):
             return
-        oid = str(c["orderId"])
-        o = self.orders.get(oid)
+        o = self.orders.get(c["orderId"])
         if o is None:
-            self._unmatched[oid] = (now, c)
+            self._unmatched[c["orderId"]] = (now, c)
             if len(self._unmatched) > 200:
                 self._unmatched = {k: v for k, v in self._unmatched.items() if v[0] > now - 30}
             return
@@ -244,10 +225,10 @@ class OrderManager:
 
     def _apply(self, o: Order, c: dict, now: float) -> None:
         if c.get("cancelReason") == "MODIFY_CANCELED":
-            return
+            return  # first leg of a modify; same orderId is re-placed next
         state = str(c.get("state") or "").upper()
         status = str(c.get("status") or "").upper()
-        filled = (state == "FILLED" or status == "FILLED")
+        filled = state == "FILLED" or status == "FILLED"
         px = o.price
         try:
             if c.get("price"):
@@ -272,27 +253,30 @@ class OrderManager:
         if state == "OPEN" or status == "OPEN":
             self._reject_n[o.side] = 0
         if filled:
-            self._remove_order(o.order_id)
+            self._forget(o.order_id)
         elif state in ("CANCELED", "REJECTED") or status in ("CANCELED", "MARGIN_CANCELED", "REJECTED"):
             reason = c.get("rejectionReason") or c.get("cancelReason") or ""
             if state == "REJECTED" or status == "REJECTED":
                 self.n_reject += 1
-                self._backoff(o.side, now)
-            log.info("ORDER L%d %s %s %s", o.pair_index, o.side, state or status, reason)
-            self._remove_order(o.order_id)
+                if o.role != "take":                       # an IOC that found nothing is not a post-only reject storm
+                    self._backoff(o.side, now)
+            log.info("ORDER %s %s %s", o.side, state or status, reason)
+            self._forget(o.order_id)
 
+    # ---- reconcile with exchange truth --------------------------------------------- #
     async def reconcile(self, rows: list, now: float) -> None:
         open_ids = {str(r.get("orderId") or r.get("id")) for r in rows}
         for o in list(self.orders.values()):
             if o.order_id not in open_ids and now - o.last_action > 5 and o.cancelling_since is None:
-                log.warning("dropping ghost L%d %s order %s", o.pair_index, o.side, o.order_id)
-                self._remove_order(o.order_id)
+                log.warning("dropping ghost %s order %s", o.side, o.order_id)
+                self._forget(o.order_id)
         mine = set(self.orders)
         if now - self.last_place_ts < 3:
             return
-        recent_closed = {oid for ts, oid in self._recently_closed if now - ts < 15.0}
-        for oid in (open_ids - mine - recent_closed):
+        wall = time.time()
+        recent_closed = {oid for ts, oid in self._recently_closed if wall - ts < 15.0}
+        for oid in open_ids - mine - recent_closed:
             if oid and oid != "None":
-                self._recently_closed.append((now, oid))
+                self._recently_closed.append((wall, oid))
                 log.warning("cancelling orphan order %s", oid)
                 await self.ex.write(self.signer.cancel(self.get_market(), oid))

@@ -223,7 +223,7 @@ check("depth_micro is None with an empty book (falls back to bbo-size weighting 
 # --------------------------------------------------------------------------------------------- #
 async def scenario_falling_knife():
     print("5. end-to-end: the log-2 disaster (long $60, market falls 14bps) against the simulator")
-    bot, sim, clk = make(SESSION_MAX_LOSS_USD=100, EXTRA_LEVELS=0)  # isolates level-0 exit behavior from the reduce-ladder (see scenario_ladder)
+    bot, sim, clk = make(SESSION_MAX_LOSS_USD=100, EXTRA_LEVELS=0, ENABLE_TAKER_EXIT=0)  # isolates the limit-only exit path (taker cut: test_inventory.py)
     bot.ledger.position, bot.ledger.avg_cost, bot.ledger.opened_ts = D("0.0007368"), D("81368.6"), clk.t
     sim.position = D("0.0007368")
     px = D("81349.0"); adds_after_fall = 0
