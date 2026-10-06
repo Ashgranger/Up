@@ -35,6 +35,7 @@ def mkcfg(**env):
         "DRY_RUN": "0",
         "JOURNAL_PATH": os.devnull,
         "LEARNING_STATE_PATH": os.devnull,
+        "PREDICTOR_PATH": os.devnull,
         "MAX_ACTIONS_PER_MIN": "100000",
         "MIN_REQUOTE_S": "0.5",
         "EXTRA_LEVELS": "1",

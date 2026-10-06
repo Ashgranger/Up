@@ -251,7 +251,18 @@ class MarketMakingEngine:
                     m_dd = clamp(ONE - cfg.dyn_dd_weight * (-pnl / cfg.session_max_loss_usd), floor, ONE)
         except Exception:
             m_dd = ONE
-        m = clamp(m_inv * m_edge * m_vol * m_dd, floor, ONE)
+        # 5) predictive: shrink size when the model says a fill on this side is unlikely to net positive
+        m_pred = ONE
+        pr = getattr(self, "predictor", None)
+        if pr is not None and getattr(cfg, "enable_predictor", False) and getattr(cfg, "pred_size", True):
+            try:
+                ppos = pr.side_quality(side, md, ledger, now)
+                raw = clamp(Decimal(str((ppos - 0.30) / 0.30)), floor, ONE)
+                wgt = Decimal(str(min(1.0, cfg.pred_weight)))
+                m_pred = ONE - wgt * (ONE - raw)
+            except Exception:
+                m_pred = ONE
+        m = clamp(m_inv * m_edge * m_vol * m_dd * m_pred, floor, ONE)
         last = getattr(self, "_dyn_log", {})
         if now - last.get(side, -1e9) >= 15.0 and m < Decimal("0.95"):
             last[side] = now
@@ -260,6 +271,54 @@ class MarketMakingEngine:
                      ("%+.2fbps->%.2f" % (float(edge), float(m_edge))) if edge is not None else "warmup",
                      float(m_vol), float(m_dd))
         return m
+
+    def _pred_ev(self, side, px, cap_bps, p_old, adv_old, pm_old, fee_bps, inv_cost_bps, md, ledger, now):
+        """EV(bps) of a candidate quote = P(fill) * (capture + E[post-fill drift]) - fee - inventory cost.
+        Blends the learned models with the legacy heuristics (weight grows with data) and vetoes quotes the
+        adverse-fill model says are toxic (P(adverse) high and capture does not cover the fee)."""
+        old = Decimal(str(p_old)) * (cap_bps + pm_old - adv_old) - fee_bps - inv_cost_bps
+        pr = getattr(self, "predictor", None)
+        if pr is None or not getattr(self.cfg, "enable_predictor", False):
+            return old, p_old
+        try:
+            q = pr.quote_eval(side, px, md, ledger, now)
+        except Exception:
+            q = None
+        if q is None:
+            return old, p_old
+        wf, wd = q["w_fill"], q["w_drift"]
+        p = (1.0 - wf) * p_old + wf * q["p_fill"]
+        p = max(0.02, min(0.98, p))
+        d_old = pm_old - adv_old
+        d_mod = Decimal(str(q["drift"]))
+        d = d_old * Decimal(str(1.0 - wd)) + d_mod * Decimal(str(wd))
+        ev = Decimal(str(p)) * (cap_bps + d) - fee_bps - inv_cost_bps
+        if wd >= 0.5 and q["p_adv"] >= self.cfg.pred_veto_p and (cap_bps + d_mod) < fee_bps:
+            ev = min(ev, -abs(ev) - ONE)
+        return ev, p
+
+    def _pred_hold_flags(self, pos_side, md, ledger, now, unreal_bps, mid):
+        """(taker_exit, bad_outlook, good_outlook) for the OPEN position from the hold-loss model.
+        pos_side: BUY for a long, SELL for a short."""
+        pr = getattr(self, "predictor", None)
+        if pr is None or not getattr(self.cfg, "enable_predictor", False) or not md.bid or not md.ask or not mid:
+            return False, False, False
+        try:
+            ho = pr.hold_outlook(pos_side, md, ledger, now, float(unreal_bps), ledger.hold_s(now))
+        except Exception:
+            ho = None
+        if not ho:
+            return False, False, False
+        exp_ret, p_loss, w = ho
+        if w < 0.5 * self.cfg.pred_weight:
+            return False, False, False          # not enough data yet: legacy rules only
+        exp_loss = -exp_ret
+        cross_est = float(((md.ask - md.bid) / Decimal("2") / mid * BPS) + self.cfg.taker_fee_bps)
+        taker = (p_loss >= self.cfg.pred_hold_exit_p and exp_loss >= self.cfg.pred_hold_exit_bps
+                 and exp_loss >= cross_est * self.cfg.pred_hold_cost_mult and float(unreal_bps) < 0.5)
+        bad = (p_loss >= 0.60 and exp_loss >= 0.6)
+        good = (exp_ret >= 0.8 and p_loss <= 0.30)
+        return taker, bad, good
 
     def calculate_vwap_cross_cost(self, side: str, qty: Decimal, md: MarketData) -> Tuple[Decimal, Decimal]:
         """Calculates actual VWAP price and crossing cost in bps by walking the L2 book."""
@@ -484,12 +543,7 @@ class MarketMakingEngine:
                         if cross_velo > ZERO:
                             adv_score += cross_velo * Decimal("0.5")
                     adv_score += (sell_tox / Decimal("5.0"))
-                    # Forward-looking: what does the empirical markout model expect for a BUY right now in this
-                    # regime? A positive prediction (price tends to keep rising after buys here) means the cost
-                    # of covering this short is expected to keep growing -> treat like realized adverse flow.
-                    # Only ever ADDS urgency (clamped at ZERO) - never relaxes the existing exit triggers.
-                    pred_exit_m = l.predict_markout(BUY, regime, 0, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                    adv_score += max(ZERO, pred_exit_m) * Decimal("0.5")
+                    pred_taker, pred_bad, pred_good = self._pred_hold_flags(SELL, md, ledger, now, unreal_bps, mid)
 
                     trigger_taker = False
                     taker_why = ""
@@ -510,6 +564,9 @@ class MarketMakingEngine:
                               and unreal_bps < -self.cfg.adv_obi_loss_bps):
                             trigger_taker = True
                             taker_why = "adverse_obi_persist"
+                        elif pred_taker:
+                            trigger_taker = True
+                            taker_why = "pred_hold_loss"
 
                     if trigger_taker:
                         self._log_taker_why("BUY", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
@@ -538,11 +595,11 @@ class MarketMakingEngine:
                         breakeven_px = ledger.avg_cost * (ONE - self.cfg.maker_fee_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.bid
 
                         scratch_hold_thresh = min(max_hold * 0.4, 25.0)
-                        is_scratch_time = (hold_time > scratch_hold_thresh)
-                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.60") or is_stressed or is_scratch_time or unreal_bps < -Decimal("1.5"))
+                        is_scratch_time = (hold_time > scratch_hold_thresh and not pred_good)
+                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.60") or is_stressed or is_scratch_time or unreal_bps < -Decimal("1.5") or pred_bad)
 
                         if should_maker_scratch:
-                            if severe_buy_pressure or is_stressed or pos_ratio >= Decimal("0.85") or unreal_bps < -Decimal("1.5"):
+                            if severe_buy_pressure or is_stressed or pos_ratio >= Decimal("0.85") or unreal_bps < -Decimal("1.5") or pred_bad:
                                 cand_px = md.bid
                                 if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.bid + tick) <= breakeven_px:
                                     cand_px = md.bid + tick
@@ -628,7 +685,7 @@ class MarketMakingEngine:
                             skew_rate = l.skew_bps if l else self.cfg.skew_bps
                             inv_cost_bps = max(ZERO, (pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate if pos_usd > ZERO else ZERO
                             pred_m = l.predict_markout(BUY, regime, k, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                            c_ev = Decimal(str(c_p)) * (c_cap + pred_m - c_adv) - fee_bps - inv_cost_bps
+                            c_ev, c_p = self._pred_ev(BUY, c_px, c_cap, c_p, c_adv, pred_m, fee_bps, inv_cost_bps, md, ledger, now)
 
                             if c_ev > best_ev:
                                 best_ev = c_ev
@@ -658,7 +715,7 @@ class MarketMakingEngine:
                         fee_bps = self.cfg.maker_fee_bps
                         skew_rate = l.skew_bps if l else self.cfg.skew_bps
                         inv_cost_bps = max(ZERO, (pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate if pos_usd > ZERO else ZERO
-                        ev_bps = Decimal(str(p_fill)) * (capture_bps - adv_bps) - fee_bps - inv_cost_bps
+                        ev_bps, p_fill = self._pred_ev(BUY, cand_px, capture_bps, p_fill, adv_bps, ZERO, fee_bps, inv_cost_bps, md, ledger, now)
                         l0_bid_px = cand_px
                     else:
                         anchor = l0_bid_px if l0_bid_px is not None else md.bid
@@ -677,7 +734,7 @@ class MarketMakingEngine:
                         skew_rate = l.skew_bps if l else self.cfg.skew_bps
                         inv_cost_bps = max(ZERO, (pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate if pos_usd > ZERO else ZERO
                         pred_m = l.predict_markout(BUY, regime, k, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                        ev_bps = Decimal(str(p_fill)) * (capture_bps + pred_m - adv_bps) - fee_bps - inv_cost_bps
+                        ev_bps, p_fill = self._pred_ev(BUY, cand_px, capture_bps, p_fill, adv_bps, pred_m, fee_bps, inv_cost_bps, md, ledger, now)
 
                     if is_liquid_market:
                         cand_px = min(cand_px, md.bid)
@@ -719,12 +776,7 @@ class MarketMakingEngine:
                         if cross_velo < ZERO:
                             adv_score += abs(cross_velo) * Decimal("0.5")
                     adv_score += (buy_tox / Decimal("5.0"))
-                    # Forward-looking: what does the empirical markout model expect for a SELL right now in this
-                    # regime? A positive prediction (price tends to keep falling after sells here) means this
-                    # long is expected to keep losing -> treat like realized adverse flow. Only ever ADDS
-                    # urgency (clamped at ZERO) - never relaxes the existing exit triggers.
-                    pred_exit_m = l.predict_markout(SELL, regime, 0, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                    adv_score += max(ZERO, pred_exit_m) * Decimal("0.5")
+                    pred_taker, pred_bad, pred_good = self._pred_hold_flags(BUY, md, ledger, now, unreal_bps, mid)
 
                     trigger_taker = False
                     taker_why = ""
@@ -745,6 +797,9 @@ class MarketMakingEngine:
                               and unreal_bps < -self.cfg.adv_obi_loss_bps):
                             trigger_taker = True
                             taker_why = "adverse_obi_persist"
+                        elif pred_taker:
+                            trigger_taker = True
+                            taker_why = "pred_hold_loss"
 
                     if trigger_taker:
                         self._log_taker_why("SELL", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
@@ -773,11 +828,11 @@ class MarketMakingEngine:
                         breakeven_px = ledger.avg_cost * (ONE + self.cfg.maker_fee_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.ask
 
                         scratch_hold_thresh = min(max_hold * 0.4, 25.0)
-                        is_scratch_time = (hold_time > scratch_hold_thresh)
-                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.60") or is_stressed or is_scratch_time or unreal_bps < -Decimal("1.5"))
+                        is_scratch_time = (hold_time > scratch_hold_thresh and not pred_good)
+                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.60") or is_stressed or is_scratch_time or unreal_bps < -Decimal("1.5") or pred_bad)
 
                         if should_maker_scratch:
-                            if severe_sell_pressure or is_stressed or pos_ratio >= Decimal("0.85") or unreal_bps < -Decimal("1.5"):
+                            if severe_sell_pressure or is_stressed or pos_ratio >= Decimal("0.85") or unreal_bps < -Decimal("1.5") or pred_bad:
                                 cand_px = md.ask
                                 if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.ask - tick) >= breakeven_px:
                                     cand_px = md.ask - tick
@@ -863,7 +918,7 @@ class MarketMakingEngine:
                             skew_rate = l.skew_bps if l else self.cfg.skew_bps
                             inv_cost_bps = max(ZERO, -(pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate if pos_usd < ZERO else ZERO
                             pred_m = l.predict_markout(SELL, regime, k, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                            c_ev = Decimal(str(c_p)) * (c_cap + pred_m - c_adv) - fee_bps - inv_cost_bps
+                            c_ev, c_p = self._pred_ev(SELL, c_px, c_cap, c_p, c_adv, pred_m, fee_bps, inv_cost_bps, md, ledger, now)
 
                             if c_ev > best_ev:
                                 best_ev = c_ev
@@ -893,7 +948,7 @@ class MarketMakingEngine:
                         fee_bps = self.cfg.maker_fee_bps
                         skew_rate = l.skew_bps if l else self.cfg.skew_bps
                         inv_cost_bps = max(ZERO, -(pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate if pos_usd < ZERO else ZERO
-                        ev_bps = Decimal(str(p_fill)) * (capture_bps - adv_bps) - fee_bps - inv_cost_bps
+                        ev_bps, p_fill = self._pred_ev(SELL, cand_px, capture_bps, p_fill, adv_bps, ZERO, fee_bps, inv_cost_bps, md, ledger, now)
                         l0_ask_px = cand_px
                     else:
                         anchor = l0_ask_px if l0_ask_px is not None else md.ask
@@ -912,7 +967,7 @@ class MarketMakingEngine:
                         skew_rate = l.skew_bps if l else self.cfg.skew_bps
                         inv_cost_bps = max(ZERO, -(pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate if pos_usd < ZERO else ZERO
                         pred_m = l.predict_markout(SELL, regime, k, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                        ev_bps = Decimal(str(p_fill)) * (capture_bps + pred_m - adv_bps) - fee_bps - inv_cost_bps
+                        ev_bps, p_fill = self._pred_ev(SELL, cand_px, capture_bps, p_fill, adv_bps, pred_m, fee_bps, inv_cost_bps, md, ledger, now)
 
                     if is_liquid_market:
                         cand_px = max(cand_px, md.ask)
