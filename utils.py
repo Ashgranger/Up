@@ -27,6 +27,9 @@ def q_up(x: Decimal, unit: Decimal) -> Decimal:
 def to_int(value: Decimal, unit: Decimal) -> int:
     """Exact decimal -> integer ticks/quantums (the signed payload needs exactness)."""
     n = value / unit
+    rounded = round(n)
+    if abs(n - rounded) < Decimal("0.00001"):
+        return int(rounded)
     if n != n.to_integral_value():
         raise ValueError(f"{value} is not a multiple of {unit}")
     return int(n)
@@ -50,8 +53,19 @@ def bps_diff(a: Decimal, b: Decimal) -> Decimal:
 
 
 def setup_logging(level: str = "INFO") -> None:
+    """Dated timestamps (multi-day runs) + optional size-rotated file via LOG_FILE / LOG_MAX_MB / LOG_BACKUPS."""
+    import os
+    from logging.handlers import RotatingFileHandler
+    handlers = [logging.StreamHandler()]
+    path = os.getenv("LOG_FILE", "").strip()
+    if path:
+        mb = float(os.getenv("LOG_MAX_MB", "20"))
+        handlers.append(RotatingFileHandler(path, maxBytes=int(mb * 1024 * 1024),
+                                            backupCount=int(os.getenv("LOG_BACKUPS", "10")), encoding="utf-8"))
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S"
+        datefmt="%m-%d %H:%M:%S",
+        handlers=handlers,
+        force=True,
     )
