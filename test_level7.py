@@ -512,6 +512,92 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(botmod.in_et_windows("18:00-09:30", at(12, 0)))
         self.assertTrue(botmod.in_et_windows("09:30-09:45,18:00-09:30", at(9, 35)))
 
+    async def test_24_outside_rth_keeps_unwinding_open_position(self):
+        bot, s, clock = sim.make(QUOTE_OUTSIDE_RTH="0", EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", MIN_REQUOTE_S="0.1")
+        mk = bot._get_market()
+        orig = mk.is_outside_rth
+        try:
+            await sim.step(bot, s, clock, "80000.0", "80080.0")
+            s.taker(SELL)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            await sim.step(bot, s, clock, "80000.0", "80080.0", dt=1.0)
+            self.assertNotEqual(bot.ledger.position, D(0), "setup: should hold a position")
+            mk.is_outside_rth = True
+            for _ in range(3):
+                await sim.step(bot, s, clock, "80000.0", "80080.0", dt=1.0)
+            live = [o for o in bot.om.orders.values() if not o.is_taker]
+            self.assertTrue([o for o in live if o.side == SELL], "unwind order must stay live outside RTH")
+            self.assertFalse([o for o in live if o.side == BUY], "no new adds outside RTH")
+        finally:
+            mk.is_outside_rth = orig
+
+    async def test_25_dms_quota_exhausted_stops_retrying(self):
+        bot, s, clock = sim.make()
+        calls = []
+        async def fake_write(payload):
+            calls.append(payload)
+            return {"status": 429, "error": {"type": "APIError", "message": "schedule cancel trigger limit reached (10 per UTC day)"}}
+        bot.ex.write = fake_write
+        object.__setattr__(bot.cfg, "dry_run", False) if hasattr(bot.cfg, "__dataclass_fields__") else None
+        bot.signer.schedule_cancel = lambda info, dl: {"dl": dl}
+        bot.md.info = bot.md.info or object()
+        await bot._heartbeat(100.0)
+        await bot._heartbeat(200.0)
+        await bot._heartbeat(300.0)
+        self.assertEqual(len(calls), 1, "must stop retrying once the daily quota error is returned")
+        self.assertGreater(bot._dms_blocked_until, 0.0)
+
+    async def test_25_market_info_refresh_updates_mark_and_rth(self):
+        bot, s, clock = sim.make(MARKET_REFRESH_S="1")
+        info = bot._get_market()
+        o_mark, o_rth, o_st = info.mark, info.is_outside_rth, info.status
+        try:
+            raw = {"marketId": 1, "marketDisplayName": info.name, "status": "ONLINE", "tickSize": str(info.tick),
+                   "stepSize": str(info.step), "minOrderNotional": str(info.min_notional), "minOrderSize": str(info.min_size),
+                   "maxOrderSize": str(info.max_size), "markPrice": "123.45", "isOutsideRth": True}
+            async def fake(market=None):
+                return [raw]
+            bot.ex.fetch_markets = fake
+            await bot._refresh_market_info(100.0)
+            self.assertEqual(info.mark, D("123.45"))
+            self.assertTrue(info.is_outside_rth)
+            self.assertEqual(info.tick, bot._get_market().tick)
+        finally:
+            info.mark, info.is_outside_rth, info.status = o_mark, o_rth, o_st
+
+    async def test_26b_oracle_guard_blocks_wrong_side(self):
+        async def run(flag, mark):
+            bot, s, clock = sim.make(ORACLE_GUARD=flag, ORACLE_GUARD_BPS="3.0", EXTRA_LEVELS=0, MIN_REQUOTE_S="0.1")
+            info = bot._get_market()
+            old = info.mark
+            try:
+                info.mark = D(mark)
+                for _ in range(3):
+                    bot.md.info_ts = clock.t
+                    await sim.step(bot, s, clock, "80000.0", "80080.0", dt=1.0)
+                live = [o for o in bot.om.orders.values() if not o.is_taker]
+                return any(o.side == BUY for o in live), any(o.side == SELL for o in live)
+            finally:
+                info.mark = old
+        self.assertEqual(await run("1", "80500"), (True, False), "oracle far above book -> no SELL adds")
+        self.assertEqual(await run("1", "79500"), (False, True), "oracle far below book -> no BUY adds")
+        self.assertEqual(await run("0", "80500"), (True, True), "off by default")
+
+    async def test_27_dust_position_does_not_lock_quoting(self):
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100, MIN_REQUOTE_S="0.1")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        m = bot._get_market()
+        bot.ledger.position = m.min_size / D(10)            # untradeable dust
+        bot.ledger.avg_cost = D("80100")                    # looks like a deep unrealized loss
+        for _ in range(4):
+            await sim.step(bot, s, clock, "80000.0", "80080.0", dt=1.0)
+        live = [o for o in bot.om.orders.values() if not o.is_taker]
+        self.assertTrue([o for o in live if o.side == BUY] and [o for o in live if o.side == SELL],
+                        "dust must be treated as flat -> normal two-sided quoting")
+        self.assertFalse([o for o in bot.om.orders.values() if o.is_taker], "no taker exit for dust")
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
