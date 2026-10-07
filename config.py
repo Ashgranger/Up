@@ -225,24 +225,6 @@ class Config:
     cross_div_adverse_mult: float = 1.0
     cross_flow_weight: float = 0.3
 
-    # --- Predictive layer (predictor.py) ----------------------------------- #
-    enable_predictor: bool = True
-    predictor_path: str = "predictor_state.json"
-    pred_weight: float = 0.8            # max blend of model vs legacy heuristics
-    pred_warmup_fills: int = 40         # fills until drift/adverse models get full weight
-    pred_fill_full_n: int = 600         # samples until fill model gets full weight
-    pred_hold_full_n: int = 400
-    pred_sample_s: float = 0.5
-    pred_fill_horizon_s: float = 2.0
-    pred_hold_horizon_s: float = 5.0
-    pred_adv_thresh_bps: float = 0.4    # drift below -this after a fill counts as "adverse"
-    pred_hold_loss_bps: float = 1.5
-    pred_veto_p: float = 0.78           # P(adverse) above which a quote must clear fee on its own
-    pred_hold_exit_p: float = 0.70      # P(big loss) needed for a predictive taker exit
-    pred_hold_exit_bps: float = 1.5     # expected further loss (bps) needed for a predictive taker exit
-    pred_hold_cost_mult: float = 1.0    # expected loss must exceed crossing cost x this
-    pred_size: bool = True              # scale adding size by P(fill pnl > 0)
-
     @classmethod
     def from_env(cls) -> "Config":
         env_name = str(_e("ARCUS_ENV", "testnet")).lower()
@@ -369,7 +351,7 @@ class Config:
             loop_s=float(_e("LOOP_S", 0.25)),
             heartbeat_s=float(_e("HEARTBEAT_S", 5)),
             dms_enabled=_b("DMS_ENABLED", "1"),
-            dms_ttl_s=min(300.0, max(6.0, float(_e("DMS_TTL_S", 30)))),
+            dms_ttl_s=min(86400.0, max(6.0, float(_e("DMS_TTL_S", 30)))),
             dms_required=_b("DMS_REQUIRED", "0"),
             reconcile_s=float(_e("RECONCILE_S", 5)),
             status_s=float(_e("STATUS_S", 15)),
@@ -396,22 +378,6 @@ class Config:
             cross_liq_usd=float(_e("CROSS_LIQ_USD", 50000)),
             cross_div_adverse_mult=float(_e("CROSS_DIV_ADVERSE_MULT", 1.0)),
             cross_flow_weight=float(_e("CROSS_FLOW_WEIGHT", 0.3)),
-            enable_predictor=_b("ENABLE_PREDICTOR", "1"),
-            predictor_path=str(_e("PREDICTOR_PATH", f"predictor_{'paper' if dry else 'live'}_{market}.json")),
-            pred_weight=float(_e("PRED_WEIGHT", 0.8)),
-            pred_warmup_fills=int(_e("PRED_WARMUP_FILLS", 40)),
-            pred_fill_full_n=int(_e("PRED_FILL_FULL_N", 600)),
-            pred_hold_full_n=int(_e("PRED_HOLD_FULL_N", 400)),
-            pred_sample_s=float(_e("PRED_SAMPLE_S", 0.5)),
-            pred_fill_horizon_s=float(_e("PRED_FILL_HORIZON_S", 2.0)),
-            pred_hold_horizon_s=float(_e("PRED_HOLD_HORIZON_S", 5.0)),
-            pred_adv_thresh_bps=float(_e("PRED_ADV_THRESH_BPS", 0.4)),
-            pred_hold_loss_bps=float(_e("PRED_HOLD_LOSS_BPS", 1.5)),
-            pred_veto_p=float(_e("PRED_VETO_P", 0.78)),
-            pred_hold_exit_p=float(_e("PRED_HOLD_EXIT_P", 0.70)),
-            pred_hold_exit_bps=float(_e("PRED_HOLD_EXIT_BPS", 1.5)),
-            pred_hold_cost_mult=float(_e("PRED_HOLD_COST_MULT", 1.0)),
-            pred_size=_b("PRED_SIZE", "1"),
         )
         if cfg.max_position_usd < cfg.order_usd:
             raise Fatal("MAX_POSITION_USD must be >= ORDER_USD")

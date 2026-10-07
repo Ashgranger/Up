@@ -20,7 +20,6 @@ from signer import Signer
 from ledger import Ledger, Fill
 from engine import MarketMakingEngine, QuoteTarget
 from orders import OrderManager, Order
-from predictor import Predictor
 from utils import BPS, BUY, SELL, ZERO, ONE, Fatal, fmt
 
 log = logging.getLogger("bot")
@@ -91,8 +90,6 @@ class MarketMaker:
         self._loss_pause_until = 0.0
         self._pnl_base = ZERO
         self.engine = MarketMakingEngine(cfg)
-        self.predictor = Predictor(cfg)
-        self.engine.predictor = self.predictor
         self.om = OrderManager(cfg, self.ex, self.signer, self._get_market, self._on_fill)
 
         self._recent_fills: deque = deque()
@@ -114,6 +111,7 @@ class MarketMaker:
         self._dms_armed = False
         self._dms_fail = 0
         self._dms_ok_until = 0.0
+        self._dms_backoff_until = 0.0
         self._files: dict = {}
         self._tick_on_trades = os.getenv("TICK_ON_TRADES", "1").strip().lower() in ("1", "true", "yes", "on")
 
@@ -244,10 +242,6 @@ class MarketMaker:
         min_notional = m.min_notional if m else Decimal("5")
         
         is_maker = not getattr(o, "is_taker", False)
-        try:
-            self.predictor.on_fill(side, o.pair_index, price, self.md, self.ledger, now, is_maker=is_maker)
-        except Exception as e:
-            log.debug("predictor.on_fill error: %s", e)
         fill = self.ledger.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
         current_mid = self.md.mid or price
         log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s ET=%s",
@@ -255,10 +249,7 @@ class MarketMaker:
                  fmt(self.ledger.position), fmt(self.ledger.total_pnl(current_mid)),
                  et_hhmmss(time.time()))
         try:
-            lp = getattr(self.predictor, "last_fill_pred", None) or {}
             self._fill_ctx = {
-                "pred_p_fill": round(lp.get("p_fill", 0.0), 3), "pred_p_adv": round(lp.get("p_adv", 0.0), 3),
-                "pred_drift2": round(lp.get("drift", 0.0), 3), "pred_drift5": round(lp.get("drift5", 0.0), 3),
                 "level": o.pair_index, "et": et_hhmmss(time.time()),
                 "obi": float(self.md.obi), "tfi": float(self.md.trade_flow_imbalance(10.0, now)),
                 "spr_bps": float(self.md.spread_bps), "taker": bool(getattr(o, "is_taker", False)),
@@ -519,18 +510,10 @@ class MarketMaker:
                     sell_blocked = True
 
             existing_slots = set(self.om.pair_slots.keys())
-            try:
-                self.predictor.on_tick(self.md, self.ledger, now)
-            except Exception as e:
-                log.debug("predictor.on_tick error: %s", e)
             targets = self.engine.generate_ladder_quotes(
                 m, self.md, self.ledger, now, buy_blocked, sell_blocked, existing_slots=existing_slots
             )
             self._log_quote_opportunity(targets, now)
-            try:
-                self.predictor.register_quotes(targets, self.md, self.ledger, now)
-            except Exception as e:
-                log.debug("predictor.register error: %s", e)
 
             blocked_sides = set()
             if buy_blocked:
@@ -544,7 +527,13 @@ class MarketMaker:
         cfg = self.cfg
         if cfg.dry_run or not cfg.dms_enabled or not self.md.info:
             return
-        interval = min(cfg.heartbeat_s, cfg.dms_ttl_s / 3.0)
+        # NOTE: this used to be min(cfg.heartbeat_s, cfg.dms_ttl_s / 3.0) - with the default
+        # HEARTBEAT_S=5 that floored the refresh to every 5s regardless of DMS_TTL_S, i.e. up to
+        # ~17k scheduleCancel calls/day against Arcus's documented 10-per-UTC-day budget (plus one
+        # more on every reconnect - see line ~705). Refresh cadence must be driven by the TTL alone.
+        interval = cfg.dms_ttl_s / 3.0
+        if now < self._dms_backoff_until:
+            return
         if now - self._last_heartbeat < interval:
             return
         self._last_heartbeat = now
@@ -562,10 +551,24 @@ class MarketMaker:
                 self._dms_ok_until = now + cfg.dms_ttl_s
                 return
             self._dms_fail += 1
-            if self._dms_fail in (1, 3) or self._dms_fail % 12 == 0:
+            err_text = json.dumps(resp.get("error") if isinstance(resp, dict) else resp)[:300] if isinstance(resp, dict) else str(resp)
+            status = resp.get("status") if isinstance(resp, dict) else None
+            is_quota = (status == 429) or ("per UTC day" in err_text) or ("trigger limit" in err_text)
+            if is_quota:
+                # Exchange-side daily quota is exhausted (this process's own hammering, other
+                # restarts today, or another session) - retrying every `interval` seconds cannot
+                # succeed and only wastes the small amount of budget left for the day. Back off
+                # for an hour and say so loudly ONCE; the last successfully-armed TTL (if any) is
+                # all the protection in place until either the quota resets or this is fixed.
+                self._dms_backoff_until = now + 3600.0
+                if self._dms_fail in (1,) or self._dms_fail % 20 == 0:
+                    log.error("DEAD MAN'S SWITCH: Arcus scheduleCancel quota exhausted (status=%s %s). "
+                              "NOT retrying for 1h - orders are UNPROTECTED if this process dies or the "
+                              "connection drops%s.", status, err_text,
+                              "" if not self._dms_armed else " (last successful arm covers you only until it expires)")
+            elif self._dms_fail in (1, 3) or self._dms_fail % 12 == 0:
                 log.error("DEAD MAN'S SWITCH NOT ARMED (attempt %d): status=%s %s",
-                          self._dms_fail, resp.get("status") if isinstance(resp, dict) else None,
-                          json.dumps(resp.get("error") if isinstance(resp, dict) else resp)[:300])
+                          self._dms_fail, status, err_text)
         except Exception as e:
             self._dms_fail += 1
             log.error("dead man's switch refresh error: %s", e)
@@ -638,12 +641,16 @@ class MarketMaker:
             fr = cr.fresh(now)
             div = cr.lead_lag_divergence_bps(self.md.mid, now)
             down, up = cr.liq_pressure_usd(30.0, now)
-            log.info("CROSS | venues=%s | div=%+.2fbps vel3s=%+.2fbps obi=%+.2f tfi5s=%+.2f disp=%.2fbps | liq30s sell=$%.0f buy=$%.0f",
+            health = cr.liq_feed_health(now)
+            liq_health_str = ",".join(
+                f"{v.venue}:{health[v.venue][0]}ev/last{health[v.venue][1]:.0f}s" if v.venue in health
+                else f"{v.venue}:NONE_SEEN"
+                for v in fr
+            ) or "n/a"
+            log.info("CROSS | venues=%s | div=%+.2fbps vel3s=%+.2fbps obi=%+.2f tfi5s=%+.2f disp=%.2fbps | liq30s sell=$%.0f buy=$%.0f | liqfeed[%s]",
                      ",".join(v.venue for v in fr) or "NONE (feeds down - signals off)",
                      float(div), float(cr.cross_velocity_bps(3.0, now)), float(cr.cross_obi(now)),
-                     float(cr.cross_tfi(5.0, now)), float(cr.cross_dispersion_bps(now)), down, up)
-        if getattr(self.cfg, "enable_predictor", False):
-            log.info(self.predictor.summary())
+                     float(cr.cross_tfi(5.0, now)), float(cr.cross_dispersion_bps(now)), down, up, liq_health_str)
         if self.cfg.enable_online_learning:
             s = self.ledger.learner.get_summary()
             p = s["params"]
@@ -768,7 +775,6 @@ class MarketMaker:
                 reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
 
         log.info("Stopping bot - cancelling resting orders for market %s...", self.md.info.name if self.md.info else self.cfg.market)
-        self.predictor.save()
         if self.cfg.enable_online_learning:
             self.ledger.learner.save()
             log.info("Saved online learning state to %s", self.cfg.learning_state_path)

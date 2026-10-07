@@ -114,28 +114,3 @@ Run live or simulated trading:
 python3 main.py --mode sim
 python3 main.py --mode live
 ```
-
----
-
-## Predictive layer (`predictor.py`)
-
-Online-learned models (pure python, persisted to `PREDICTOR_PATH`), all signed by side so one model serves bids and asks:
-
-| Model | Predicts | Label source |
-|---|---|---|
-| FILL | P(our quote fills within 2s) | our resting quotes, sampled every 0.5s per level |
-| ADVERSE | P(mid drifts < -0.4bps within 2s of our fill) | pre-fill feature snapshot (>=250ms old) + mid at +2s |
-| DRIFT 2s/5s | E[post-fill drift] and residual sigma -> P(fill PnL > 0) | same, +2s / +5s |
-| HOLD / HOLD-LOSS | E[return of an open position over 5s], P(loss > 1.5bps) | unconditional both-direction samples every 1s (learns while flat) + open-position extras |
-
-Features (28): multi-depth OBI, microprice, TFI at 250ms/1s/5s/10s + acceleration, returns, vol, spread, trade intensity,
-fragility, consumption rate, queue ahead, quote distance, inventory ratio, cross-venue velocity/divergence, basis, funding, side toxicity, hold time, unrealised bps.
-
-How it is used:
-1. **Quote EV** = `P(fill) * (capture + E[drift|fill]) - fee - inventory cost`, blended with the legacy heuristic by a warm-up weight (35% -> `PRED_WEIGHT` as data accumulates). Quotes below `min_ev` are not placed.
-2. **Adverse veto**: if P(adverse) >= `PRED_VETO_P` and capture + drift < fee, the quote is dropped.
-3. **Size**: adding-side size is scaled by P(fill PnL > 0) (`PRED_SIZE`).
-4. **Inventory**: hold-loss model drives (a) a predictive taker exit `pred_hold_loss` when expected further loss > crossing cost, P(loss) high and the position is not in profit, (b) an earlier maker scratch at the touch when the outlook is bad, (c) patience (no time-based scratch) when the outlook is clearly good.
-5. Fill journal rows now carry `pred_p_fill / pred_p_adv / pred_drift2 / pred_drift5` so you can check calibration offline; the status line prints `PRED n[...] ... hit=%` (drift hit-rate > 50% means the model has real signal).
-
-Tests: `python3 -m unittest test_level7.py test_predictor.py` (58 tests).
