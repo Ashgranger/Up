@@ -88,7 +88,7 @@ Optional extra speed:  pip install uvloop orjson
 - Trade-off: a maker exit can sit unfilled while price keeps running; that is what TAKER_HARD_STOP_BPS is for.
 
 ## Lighter RH feed + hedge (HEDGE_ENABLED=1/0)
-- lighter.py: LighterBook (nonce-checked order_book channel), LighterFeed (public WS: order_book/market_stats/trade, optional account_all_positions), LighterHedger (net-exposure hedging, 60 req/min budget, paper|live).
+- lighter_hedge.py (was lighter.py, which SHADOWED the official `lighter` SDK): LighterBook (nonce-checked order_book channel), LighterFeed (public WS: order_book/market_stats/trade, optional account_all_positions), LighterHedger (net-exposure hedging, 60 req/min budget, paper|live).
 - Measured on 11,200 samples (10-08 15:00-15:52 UTC): basis +9.4bps (sd 2.8, drifts 15->8 in 15 min), cost per hedge 2.3bps (median 1.5), cost flickers (autocorr 0.07 at 1s; after a cheap sample the cost 0.28s later is back to the mean) so gating on the instantaneous Lighter spread is useless, 0.46% glitch samples up to 262bps (slippage cap rejects them), basis change risk sd 2.0bps/10s, 2.3bps/60s.
 - Fixes: basis-neutral locked edge, smoothed cost model, per-side edge floors (cost x2 for entry+exit hedge), glitch-robust basis EMA, HEDGE_COST/HEDGE_STATS logs, combined PnL in STATUS.
 - Live mode is NOT verified against the real exchange (no network in the build sandbox). Run paper first.
@@ -98,3 +98,9 @@ Optional extra speed:  pip install uvloop orjson
 - Paper fill model uses REAL Lighter trade prints (price reaches ours; if only joining the touch, the queue ahead must trade first). Touch-only data cannot answer fill probability: my simulation on the CSV bracketed it between 0% (price must cross) and ~100% (any touch change), so 0.25-0.3bps is NOT proven.
 - Edge floor uses the measured blend P(fill) x maker cost + (1-P) x taker fallback once >= 5 posts exist.
 - hedge_report.py prints real cost by style from HEDGE_COST lines. Live maker path (create_order post-only + cancel_order) is unverified against the exchange.
+
+## Hedge start-up errors fixed (10-09 log)
+- "module 'lighter' has no attribute 'SignerClient'": our own lighter.py shadowed the official `lighter` SDK. Renamed to lighter_hedge.py (test_40 guards against a local lighter.py/lighter/).
+- "could not start ... running WITHOUT hedge" while Arcus orders were REAL: HEDGE_REQUIRED=1 (default) now stops the bot at startup instead.
+- Cost accounting was biased low: after a maker wait the reference mid was re-read AFTER the wait, so 2.5s+latency drift was missing. Reference is now the Lighter mid when the exposure appeared; cost = spread at execution + wait drift (HEDGE_COST total/spread/drift). Maker attempts log Lighter prints seen during the wait.
+- hedge_report.py reads both log formats.

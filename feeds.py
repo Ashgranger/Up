@@ -257,7 +257,7 @@ class CrossFeedManager:
             self.feeds.append(BinanceFeed(sink, derive_symbol(cfg.market, cfg.binance_symbol),
                                           cfg.binance_ws_url, connect))
         if "lighter" in venues:
-            from lighter import LighterFeed
+            from lighter_hedge import LighterFeed
             self.feeds.append(LighterFeed(sink, cfg, connect))
         if "bybit" in venues:
             self.feeds.append(BybitFeed(sink, derive_symbol(cfg.market, cfg.bybit_symbol),

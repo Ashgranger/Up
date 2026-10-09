@@ -15,7 +15,7 @@ from typing import Any, Optional
 from config import Config
 from exchange import Exchange
 from feeds import CrossFeedManager
-from lighter import LighterFeed, LighterHedger, make_live_client
+from lighter_hedge import LighterFeed, LighterHedger, make_live_client
 from market import Market, MarketData
 from signer import Signer
 from ledger import Ledger, Fill
@@ -318,7 +318,10 @@ class MarketMaker:
                      self.cfg.hedge_max_tx_per_min)
         except Exception as e:
             self.hedger = None
-            log.error("HEDGE could not start (%s) - running WITHOUT hedge", e)
+            if self.cfg.hedge_required:
+                log.error("HEDGE could not start (%s). HEDGE_REQUIRED=1 -> NOT trading unhedged; fix it or set HEDGE_ENABLED=0 / HEDGE_REQUIRED=0", e)
+                raise Fatal(f"hedge could not start: {e}")
+            log.error("HEDGE could not start (%s) - running WITHOUT hedge (HEDGE_REQUIRED=0)", e)
 
     def _hedge_arcus_pos(self) -> Decimal:
         m = self._get_market()

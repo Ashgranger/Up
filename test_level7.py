@@ -639,7 +639,7 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
             "asks": [{"price": ask, "size": "5"}, {"price": "235.70", "size": "10"}]}})
 
     async def test_34_lighter_book_nonce_gap_and_vwap(self):
-        from lighter import LighterBook
+        from lighter_hedge import LighterBook
         import json as _j
         bk = LighterBook()
         bk.snapshot(_j.loads(self._lighter_snapshot())["order_book"], 1.0)
@@ -653,7 +653,7 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(px, (D("5") * D("235.52") + D("2") * D("235.70")) / D("7"))
 
     async def test_35_lighter_feed_publishes_to_sink_and_flags_gap(self):
-        from lighter import LighterFeed
+        from lighter_hedge import LighterFeed
         bot, s, clock = sim.make(HEDGE_ENABLED="1", LIGHTER_MARKET_ID="1")
         got = []
         bot.on_external_venue_bbo = lambda v, b, a, bs, asz: got.append((v, b, a))
@@ -665,7 +665,7 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         feed.handle('{"type":"update/trade","trades":[{"price":"235.5","size":"0.2","is_maker_ask":true}]}')
 
     def _mk_hedger(self, bot, clock, **env):
-        from lighter import LighterFeed, LighterHedger
+        from lighter_hedge import LighterFeed, LighterHedger
         feed = LighterFeed(bot, bot.cfg, None, lambda: clock.t)
         feed.handle(self._lighter_snapshot())
         feed.last_bbo_ts = clock.t
@@ -777,6 +777,38 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         h = await run("235.30", "235.31", [(0.05, {"price": "235.31", "size": "3", "is_maker_ask": True})], timeout="0.3")
         self.assertEqual(h.maker_qty, D("0"), "queue ahead not consumed -> no maker fill")
         self.assertEqual(h.taker_qty, D("1.0"))
+
+    async def test_40_no_local_module_shadows_lighter_sdk_and_required_hedge_aborts(self):
+        import os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        self.assertFalse(_os.path.exists(_os.path.join(here, "lighter.py")), "a local lighter.py would shadow the official SDK")
+        self.assertFalse(_os.path.isdir(_os.path.join(here, "lighter")))
+        from utils import Fatal
+        bot, s, clock = sim.make(HEDGE_ENABLED="1", HEDGE_MODE="live", HEDGE_REQUIRED="1", LIGHTER_MARKET_ID="1")
+        object.__setattr__(bot.cfg, "dry_run", False)            # live path needs keys -> must refuse, not quote unhedged
+        with self.assertRaises(Fatal):
+            await bot._start_hedger()
+        self.assertIsNone(bot.hedger)
+        bot2, s2, c2 = sim.make(HEDGE_ENABLED="1", HEDGE_MODE="live", HEDGE_REQUIRED="0", LIGHTER_MARKET_ID="1")
+        object.__setattr__(bot2.cfg, "dry_run", False)
+        await bot2._start_hedger()                                # HEDGE_REQUIRED=0 -> keeps running without hedge
+        self.assertIsNone(bot2.hedger)
+
+    async def test_41_cost_split_spread_vs_wait_drift(self):
+        bot, s, clock = sim.make(HEDGE_ENABLED="1", LIGHTER_MARKET_ID="1")
+        feed, h = self._mk_hedger(bot, clock)
+        h.ref_mid, h.ref_ts = D("235.41"), clock.t - 3.0          # exposure appeared when Lighter mid was 235.41
+        # 3 s later the Lighter book is 235.20/235.24 (mid 235.22): we SELL (hedging a long) at the bid 235.20
+        bbo_exec = (D("235.20"), D("235.24"), D("5"), D("5"))
+        h.record_cost(SELL, D("1"), D("235.20"), bbo_exec, clock.t)
+        usd_total = float(h.cost_cross_usd)                       # (235.20-235.41) * -1 = +0.21 cost
+        self.assertAlmostEqual(usd_total, 0.21, places=4)
+        self.assertAlmostEqual(float(h.cost_spread_usd), 0.02, places=4)     # crossing half-spread at execution
+        self.assertAlmostEqual(float(h.cost_drift_usd), 0.19, places=4)      # price moved against us while waiting
+        self.assertAlmostEqual(float(h.cost_spread_usd + h.cost_drift_usd), usd_total, places=6)
+        rep = h.report(clock.t, force=True)
+        self.assertIn("taker: n=1", rep)
+        self.assertIn("drift", rep)
 
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""

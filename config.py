@@ -180,6 +180,7 @@ class Config:
     hedge_anchor_weight: Decimal
     hedge_edge_floor: bool
     hedge_style: str
+    hedge_required: bool
     hedge_maker_improve: Decimal
     hedge_maker_timeout_s: float
     hedge_maker_latency_ms: float
@@ -382,6 +383,7 @@ class Config:
             hedge_anchor_weight=_d("HEDGE_ANCHOR_WEIGHT", "1.0"),
             hedge_edge_floor=_b("HEDGE_EDGE_FLOOR", "1"),
             hedge_style=str(_e("HEDGE_STYLE", "taker")).lower(),
+            hedge_required=_b("HEDGE_REQUIRED", "1"),
             hedge_maker_improve=_d("HEDGE_MAKER_IMPROVE", "0.33"),
             hedge_maker_timeout_s=float(_e("HEDGE_MAKER_TIMEOUT_S", "2.5")),
             hedge_maker_latency_ms=float(_e("HEDGE_MAKER_LATENCY_MS", "200")),
