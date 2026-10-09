@@ -810,6 +810,24 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertIn("taker: n=1", rep)
         self.assertIn("drift", rep)
 
+    async def test_42_cost_vs_best_price_and_shadow_check(self):
+        import tempfile, os as _os
+        from lighter_hedge import find_shadowing_files
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(find_shadowing_files(d), [])
+            open(_os.path.join(d, "lighter.py"), "w").write("x=1")
+            self.assertEqual(len(find_shadowing_files(d)), 1)
+        bot, s, clock = sim.make(HEDGE_ENABLED="1", LIGHTER_MARKET_ID="1")
+        feed, h = self._mk_hedger(bot, clock)
+        h.ref_mid, h.ref_ts = D("235.41"), clock.t - 1
+        h.ref_bbo = (D("235.30"), D("235.52"), D("5"), D("5"))      # best bid 235.30 when the Arcus fill happened
+        h.send_bbo = (D("235.28"), D("235.50"), D("5"), D("5"))     # best bid 235.28 when the hedge was sent
+        h.record_cost(SELL, D("2"), D("235.26"), (D("235.27"), D("235.49"), D("5"), D("5")), clock.t)   # filled 1c under the best bid, deeper in the book
+        self.assertAlmostEqual(float(h.style_cost["taker"][5]), 0.04 * 2 / 1 * 1.0, places=2)           # vs best at fill: 0.04/share x 2
+        self.assertAlmostEqual(float(h.style_cost["taker"][6]), 0.02 * 2, places=2)                     # vs best at send
+        self.assertAlmostEqual(float(h.style_cost["taker"][7]), 0.01 * 2, places=2)                     # depth slippage at execution
+        self.assertIn("vs_best fill", h.report(clock.t, force=True))
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,

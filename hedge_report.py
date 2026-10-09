@@ -6,12 +6,16 @@ Also prints maker fill statistics and, if present, the Arcus-only vs hedged P&L 
 import re, sys, collections
 agg = collections.defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0, 0])   # notional, total*n, spread*n, drift*n, n, old_format_n
 posts = fills = 0
+best = collections.defaultdict(lambda: [0.0, 0.0, 0.0, 0.0])   # vs best price: at fill, at send, depth
 last_pnl = None
 for l in open(sys.argv[1], errors="ignore"):
     m = re.search(r"HEDGE_COST (\w+) (BUY|SELL) (\S+) @ (\S+) \| total=([+-][\d.]+)bps = spread ([+-][\d.]+) \+ drift ([+-][\d.]+)", l)
     if m:
         n = float(m[3]) * float(m[4]); a = agg[m[1]]
         a[0] += n; a[1] += float(m[5]) * n; a[2] += float(m[6]) * n; a[3] += float(m[7]) * n; a[4] += 1
+        b = re.search(r"exec vs best: fill ([+-][\d.]+) send ([+-][\d.]+) depth ([+-][\d.]+)", l)
+        if b:
+            best[m[1]][0] += float(b[1]) * n; best[m[1]][1] += float(b[2]) * n; best[m[1]][2] += float(b[3]) * n; best[m[1]][3] += n
         continue
     m = re.search(r"HEDGE_COST (\w+) (BUY|SELL) (\S+) @ (\S+) \| vs L_mid=([+-][\d.]+)bps", l)
     if m:
@@ -30,6 +34,9 @@ tn = tt = 0.0
 for st, (n, t, s, d, k, old) in agg.items():
     note = "  (old log format: spread only, wait-drift not included)" if old == k else ""
     print(f"{st:6s} hedges={k:4d} notional=${n:9.0f}  total={t/n:+.2f}  spread={s/n:+.2f}  drift={d/n:+.2f} bps{note}")
+    if best[st][3]:
+        bf, bs, bd, bn = best[st]
+        print(f"       price vs BEST bid/ask (+ = worse than the best price): when Arcus filled {bf/bn:+.2f} | when hedge sent {bs/bn:+.2f} | at execution (depth/queue) {bd/bn:+.2f} bps")
     tn += n; tt += t
 if tn:
     print(f"ALL    total={tt/tn:+.2f} bps   (break-even is about 0.3 bps; Arcus edge ~0.46, first-second drift ~0.14)")

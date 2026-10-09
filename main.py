@@ -53,6 +53,14 @@ def main() -> None:
         asyncio.run(scan(cfg, args.seconds))
         return
 
+    if cfg.hedge_enabled:
+        from lighter_hedge import find_shadowing_files
+        stale = find_shadowing_files(os.path.dirname(os.path.abspath(__file__)))
+        if stale:
+            sys.exit("STOP: %s would hide the official Lighter SDK (an old copy from an earlier zip).\n"
+                     "Fix:  cd %s && rm -rf lighter.py lighter __pycache__/lighter.*  (the new file is lighter_hedge.py)"
+                     % (", ".join(stale), os.path.dirname(os.path.abspath(__file__))))
+
     from bot import MarketMaker
     log.info("env=%s market=%s %s | order=$%s max_pos=$%s min_edge=%sbps skew=%sbps ladder_levels=%d "
              "min_ev=%sbps tox_mult=%s", cfg.env_name, cfg.market,
@@ -69,7 +77,11 @@ def main() -> None:
                 loop.add_signal_handler(sig, bot.stop_evt.set)
             except NotImplementedError:
                 signal.signal(sig, lambda *_: loop.call_soon_threadsafe(bot.stop_evt.set))
-        await bot.run()
+        try:
+            await bot.run()
+        except Fatal as e:
+            log.error("FATAL: %s", e)
+            sys.exit(1)
 
     try:
         import uvloop

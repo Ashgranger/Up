@@ -104,3 +104,8 @@ Optional extra speed:  pip install uvloop orjson
 - "could not start ... running WITHOUT hedge" while Arcus orders were REAL: HEDGE_REQUIRED=1 (default) now stops the bot at startup instead.
 - Cost accounting was biased low: after a maker wait the reference mid was re-read AFTER the wait, so 2.5s+latency drift was missing. Reference is now the Lighter mid when the exposure appeared; cost = spread at execution + wait drift (HEDGE_COST total/spread/drift). Maker attempts log Lighter prints seen during the wait.
 - hedge_report.py reads both log formats.
+
+## Cost vs the BEST bid/ask + stale-file stop (10-09 12:23 log)
+- The crash was the OLD /root/Up/lighter.py left over from an earlier zip (copying new files over a folder does not delete it). main.py now stops BEFORE connecting with the exact fix command, and Fatal errors exit cleanly (no traceback).
+- HEDGE_COST now also logs the fill price against the best bid/ask (a) when the Arcus fill happened, (b) when the hedge was sent, (c) at execution (= book depth / queue slippage); HEDGE_STATS and hedge_report.py print them per style.
+- Paper log check (10 taker hedges, 10-09 11:21-11:36 MSK): fills landed at the best bid/ask (avg 0.00bps vs best, +-0.43 = one tick of snapshot noise), so a taker hedge costs exactly the half-spread (0.43-1.06bps, avg 0.65) plus whatever the book moves while waiting.

@@ -290,6 +290,8 @@ class LighterHedger:
         self.cost_drift_usd = ZERO           # part lost while waiting (tick delay + maker wait + latency)
         self.style_cost: dict = {}           # style -> [notional, total_usd, spread_usd, drift_usd, n]
         self.ref_mid: Optional[Decimal] = None
+        self.ref_bbo = None                  # Lighter best bid/ask when the exposure appeared
+        self.send_bbo = None                 # ... when the hedge was sent
         self.ref_ts: Optional[float] = None
         self._trade_times: deque = deque(maxlen=5000)
         self._last_report = 0.0
@@ -418,19 +420,33 @@ class LighterHedger:
         self.cost_spread_usd += (exec_px - mid_exec) * sgn * qty
         self.cost_drift_usd += (mid_exec - ref) * sgn * qty
         self.cost_slip_usd += (exec_px - touch) * sgn * qty
-        sc = self.style_cost.setdefault(style, [ZERO, ZERO, ZERO, ZERO, 0])
+        touch_fill = None
+        if self.ref_bbo is not None:
+            touch_fill = self.ref_bbo[1] if side == BUY else self.ref_bbo[0]
+        touch_send = None
+        if self.send_bbo is not None:
+            touch_send = self.send_bbo[1] if side == BUY else self.send_bbo[0]
+        vb_fill = float((exec_px - touch_fill) * sgn / ref * BPS) if touch_fill is not None else spread_bps
+        vb_send = float((exec_px - touch_send) * sgn / ref * BPS) if touch_send is not None else spread_bps
+        sc = self.style_cost.setdefault(style, [ZERO, ZERO, ZERO, ZERO, 0, ZERO, ZERO, ZERO])
         sc[0] += notional
         sc[1] += (exec_px - ref) * sgn * qty
         sc[2] += (exec_px - mid_exec) * sgn * qty
         sc[3] += (mid_exec - ref) * sgn * qty
         sc[4] += 1
+        sc[5] += D(str(vb_fill)) / BPS * ref * qty              # usd cost vs the best price when the Arcus fill happened
+        sc[6] += D(str(vb_send)) / BPS * ref * qty              # ... when the hedge was sent
+        sc[7] += (exec_px - touch) * sgn * qty                  # ... when it executed (= book depth / queue slippage)
         prev = self.cost_ema.get(style)
         self.cost_ema[style] = total_bps if prev is None else prev + 0.2 * (total_bps - prev)
         if style == "taker":
             self.slip_ema += 0.2 * (max(-5.0, min(20.0, slip_bps)) - self.slip_ema)
         wait = (now - self.ref_ts) if self.ref_ts is not None else 0.0
-        log.info("HEDGE_COST %s %s %s @ %s | total=%+.2fbps = spread %+.2f + drift %+.2f | book_slip %+.2f | wait=%.1fs | basis=%s dev=%+.2f",
-                 style, side, qty, exec_px, total_bps, spread_bps, drift_bps, slip_bps, wait,
+        bname = "ask" if side == BUY else "bid"
+        log.info("HEDGE_COST %s %s %s @ %s | total=%+.2fbps = spread %+.2f + drift %+.2f | best %s: fill %s send %s exec %s -> exec vs best: fill %+.2f send %+.2f depth %+.2f bps | wait=%.1fs | basis=%s dev=%+.2f",
+                 style, side, qty, exec_px, total_bps, spread_bps, drift_bps, bname,
+                 touch_fill if touch_fill is not None else "-", touch_send if touch_send is not None else "-", touch,
+                 vb_fill, vb_send, slip_bps, wait,
                  ("%+.2f" % self.basis_now) if self.basis_now is not None else "-", self.basis_dev_bps())
 
     def trades_per_min(self, now: float, window_s: float = 300.0) -> float:
@@ -443,9 +459,10 @@ class LighterHedger:
         self._last_report = now
         fl = self.edge_floors()
         parts = []
-        for st_name, (nt, tot, spr, dr, n) in self.style_cost.items():
+        for st_name, (nt, tot, spr, dr, n, vf, vs, vd) in self.style_cost.items():
             if nt:
-                parts.append(f"{st_name}: n={n} total={float(tot/nt*BPS):+.2f} (spread {float(spr/nt*BPS):+.2f} drift {float(dr/nt*BPS):+.2f})bps")
+                parts.append(f"{st_name}: n={n} total={float(tot/nt*BPS):+.2f} (spread {float(spr/nt*BPS):+.2f} drift {float(dr/nt*BPS):+.2f}) "
+                             f"vs_best fill {float(vf/nt*BPS):+.2f} send {float(vs/nt*BPS):+.2f} depth {float(vd/nt*BPS):+.2f} bps")
         avg = float((self.cost_cross_usd / self.cost_notional) * BPS) if self.cost_notional else 0.0
         fp = (self.maker_filled_attempts / self.maker_attempts) if self.maker_attempts else 0.0
         return (f"HEDGE_STATS n={self.cost_n} notional=${float(self.cost_notional):.0f} avg_cost={avg:+.2f}bps "
@@ -534,6 +551,7 @@ class LighterHedger:
         if self.exposure_since is None:
             self.exposure_since = now
             self.ref_mid = (bbo[0] + bbo[1]) / 2          # cost reference: Lighter mid when the Arcus fill created the exposure
+            self.ref_bbo = bbo
             self.ref_ts = now
         aged = (now - self.exposure_since) >= self.cfg.hedge_max_age_s
         if usd < self.cfg.hedge_min_usd and not aged:
@@ -546,6 +564,7 @@ class LighterHedger:
             self._busy = False
 
     async def _send_hedge(self, side: str, qty: Decimal, bbo, now: float) -> None:
+        self.send_bbo = bbo
         if self.style == "maker_first":
             qty = await self._hedge_maker_first(side, qty, bbo, now)
             if qty <= 0:
@@ -753,6 +772,17 @@ class LighterHedger:
                 f"tx={self.budget_used(now)}/{min(60, int(self.cfg.hedge_max_tx_per_min))} "
                 f"L_bbo={'%s/%s' % (bbo[0], bbo[1]) if bbo else '-'} age={age:.1f}s"
                 f"{' HALTED:' + self.halted if self.halted else ''}")
+
+
+def find_shadowing_files(base_dir: str) -> list:
+    """Local files/folders that would hide the official `lighter` SDK (python puts the script folder FIRST on sys.path)."""
+    import os
+    hits = []
+    for name in ("lighter.py", "lighter"):
+        p = os.path.join(base_dir, name)
+        if os.path.exists(p):
+            hits.append(p)
+    return hits
 
 
 def make_live_client(cfg: Any):
