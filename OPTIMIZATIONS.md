@@ -86,3 +86,15 @@ Optional extra speed:  pip install uvloop orjson
 - MAKER_EXIT_FIRST=1 (with takers enabled): maker first when loss <= STRESS_LOSS_BPS + MAKER_EXIT_SLACK_BPS or queue fill prob >= MAKER_EXIT_MIN_PROB; taker only beyond that.
 - Log: EXIT_STYLE <side> -> MAKER|TAKER (<why>) rule=... Test: test_28. Note: tests that assert taker behaviour fail if you export ENABLE_TAKER_EXITS=0 globally (expected).
 - Trade-off: a maker exit can sit unfilled while price keeps running; that is what TAKER_HARD_STOP_BPS is for.
+
+## Lighter RH feed + hedge (HEDGE_ENABLED=1/0)
+- lighter.py: LighterBook (nonce-checked order_book channel), LighterFeed (public WS: order_book/market_stats/trade, optional account_all_positions), LighterHedger (net-exposure hedging, 60 req/min budget, paper|live).
+- Measured on 11,200 samples (10-08 15:00-15:52 UTC): basis +9.4bps (sd 2.8, drifts 15->8 in 15 min), cost per hedge 2.3bps (median 1.5), cost flickers (autocorr 0.07 at 1s; after a cheap sample the cost 0.28s later is back to the mean) so gating on the instantaneous Lighter spread is useless, 0.46% glitch samples up to 262bps (slippage cap rejects them), basis change risk sd 2.0bps/10s, 2.3bps/60s.
+- Fixes: basis-neutral locked edge, smoothed cost model, per-side edge floors (cost x2 for entry+exit hedge), glitch-robust basis EMA, HEDGE_COST/HEDGE_STATS logs, combined PnL in STATUS.
+- Live mode is NOT verified against the real exchange (no network in the build sandbox). Run paper first.
+
+## Maker-first hedge (HEDGE_STYLE=maker_first)
+- Post-only INSIDE the Lighter spread (improve 33% of the spread), wait HEDGE_MAKER_TIMEOUT_S (2.5s), cancel, cross the rest. ~3 tx per hedge (post, cancel, taker) => ~6/min at 2 fills/min.
+- Paper fill model uses REAL Lighter trade prints (price reaches ours; if only joining the touch, the queue ahead must trade first). Touch-only data cannot answer fill probability: my simulation on the CSV bracketed it between 0% (price must cross) and ~100% (any touch change), so 0.25-0.3bps is NOT proven.
+- Edge floor uses the measured blend P(fill) x maker cost + (1-P) x taker fallback once >= 5 posts exist.
+- hedge_report.py prints real cost by style from HEDGE_COST lines. Live maker path (create_order post-only + cancel_order) is unverified against the exchange.

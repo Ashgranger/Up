@@ -35,6 +35,7 @@ class MarketMakingEngine:
         self.cfg = cfg
         self._chase_top_until: float = 0.0
         self._chase_bottom_until: float = 0.0
+        self.hedge_edge_floor = {BUY: ZERO, SELL: ZERO}   # bps from fair; set by the bot when HEDGE is on (see LighterHedger.edge_floors)
 
     def compute_fair_value(self, md: MarketData, now: float, ledger: Optional[Ledger] = None) -> Decimal:
         base_mid = md.mid
@@ -500,6 +501,10 @@ class MarketMakingEngine:
             level_usd_buy = max(level_usd * (ONE - depth_cut_buy) * dyn_buy, m.min_notional)
             level_edge_sell = level_edge + depth_widen_sell
             level_usd_sell = max(level_usd * (ONE - depth_cut_sell) * dyn_sell, m.min_notional)
+            if self.hedge_edge_floor[BUY] > level_edge_buy:
+                level_edge_buy = self.hedge_edge_floor[BUY]
+            if self.hedge_edge_floor[SELL] > level_edge_sell:
+                level_edge_sell = self.hedge_edge_floor[SELL]
 
             # --- BUY SIDE --- #
             is_unwind_buy = (pos_usd < 0)

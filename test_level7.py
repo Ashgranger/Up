@@ -631,6 +631,153 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(bot.ledger.position, D(0))
         self.assertTrue(live)
 
+    # ---------------- Lighter RH feed + hedger ----------------
+    def _lighter_snapshot(self, bid="235.30", ask="235.52", n=100):
+        import json as _j
+        return _j.dumps({"type": "subscribed/order_book", "channel": "order_book:1", "order_book": {
+            "nonce": n, "bids": [{"price": bid, "size": "5"}, {"price": "235.20", "size": "10"}],
+            "asks": [{"price": ask, "size": "5"}, {"price": "235.70", "size": "10"}]}})
+
+    async def test_34_lighter_book_nonce_gap_and_vwap(self):
+        from lighter import LighterBook
+        import json as _j
+        bk = LighterBook()
+        bk.snapshot(_j.loads(self._lighter_snapshot())["order_book"], 1.0)
+        self.assertEqual(bk.bbo()[:2], (D("235.30"), D("235.52")))
+        self.assertTrue(bk.update({"begin_nonce": 100, "nonce": 101, "bids": [{"price": "235.30", "size": "0"}], "asks": []}, 2.0))
+        self.assertEqual(bk.bbo()[0], D("235.20"), "size 0 removes the level")
+        self.assertFalse(bk.update({"begin_nonce": 999, "nonce": 1000, "bids": [], "asks": []}, 3.0), "nonce gap -> resubscribe")
+        bk.snapshot(_j.loads(self._lighter_snapshot())["order_book"], 4.0)
+        px, filled = bk.vwap(BUY, D("7"))          # 5 @235.52 + 2 @235.70
+        self.assertEqual(filled, D("7"))
+        self.assertEqual(px, (D("5") * D("235.52") + D("2") * D("235.70")) / D("7"))
+
+    async def test_35_lighter_feed_publishes_to_sink_and_flags_gap(self):
+        from lighter import LighterFeed
+        bot, s, clock = sim.make(HEDGE_ENABLED="1", LIGHTER_MARKET_ID="1")
+        got = []
+        bot.on_external_venue_bbo = lambda v, b, a, bs, asz: got.append((v, b, a))
+        feed = LighterFeed(bot, bot.cfg, None, lambda: clock.t)
+        feed.handle(self._lighter_snapshot())
+        self.assertEqual(got[-1], ("LIGHTER", D("235.30"), D("235.52")))
+        feed.handle('{"type":"update/order_book","order_book":{"begin_nonce":5,"nonce":6,"bids":[],"asks":[]}}')
+        self.assertTrue(feed._need_resub)
+        feed.handle('{"type":"update/trade","trades":[{"price":"235.5","size":"0.2","is_maker_ask":true}]}')
+
+    def _mk_hedger(self, bot, clock, **env):
+        from lighter import LighterFeed, LighterHedger
+        feed = LighterFeed(bot, bot.cfg, None, lambda: clock.t)
+        feed.handle(self._lighter_snapshot())
+        feed.last_bbo_ts = clock.t
+        h = LighterHedger(bot.cfg, feed, lambda: bot.ledger.position, lambda: D("235.4"), None, lambda: clock.t)
+        return feed, h
+
+    async def test_36_hedger_paper_hedge_cost_budget_and_switch(self):
+        bot, s, clock = sim.make(HEDGE_ENABLED="1", LIGHTER_MARKET_ID="1", HEDGE_MODE="paper", HEDGE_LATENCY_MS="1",
+                                 HEDGE_MIN_USD="10", HEDGE_MAX_TX_PER_MIN="3", DRY_RUN="1")
+        feed, h = self._mk_hedger(bot, clock)
+        bot.ledger.position = D("1.0")                         # Arcus long 1 -> hedge = SELL 1 on Lighter at the bid
+        await h.tick(clock.t)
+        self.assertEqual(h.position, D("-1.0"))
+        self.assertEqual(h.net_exposure(), D("0"))
+        self.assertEqual(h.cost_n, 1)
+        self.assertEqual(h.n_hedges, 1)
+        # cost recorded vs Lighter mid: sold at 235.30 vs mid 235.41 -> 0.11/235.41 = 4.67bps
+        self.assertAlmostEqual(float(h.cost_cross_usd / h.cost_notional * 10000), 4.67, places=1)
+        # request budget: 3/min cap
+        for i in range(5):
+            clock.t += 1
+            feed.last_bbo_ts = clock.t
+            bot.ledger.position += D("1.0")
+            await h.tick(clock.t)
+        self.assertLessEqual(h.budget_used(clock.t), 3)
+        # switch off: nothing happens
+        bot2, s2, c2 = sim.make(HEDGE_ENABLED="0")
+        self.assertIsNone(bot2.hedger)
+
+    async def test_37_basis_neutral_edge_and_floors_from_sample_stats(self):
+        bot, s, clock = sim.make(HEDGE_ENABLED="1", LIGHTER_MARKET_ID="1", HEDGE_BASIS_HALFLIFE_S="300",
+                                 HEDGE_TARGET_EDGE_BPS="0.5", HEDGE_COST_MULT="2.0", HEDGE_ANCHOR_WEIGHT="1.0")
+        feed, h = self._mk_hedger(bot, clock)
+        # Arcus book 235.28/235.29 ; Lighter 235.30/235.52 (basis ~ +9.4 bps, Lighter half-spread ~ 4.7 bps)
+        for i in range(50):
+            clock.t += 1.0
+            feed.last_bbo_ts = clock.t
+            h.observe(clock.t, D("235.08"), D("235.09"))      # Arcus mid 235.085 vs Lighter mid 235.41
+        self.assertAlmostEqual(h.basis_ema, 13.8, delta=0.3)
+        self.assertAlmostEqual(h.basis_dev_bps(), 0.0, delta=0.3)
+        fb, fs = h.edge_floors()
+        self.assertAlmostEqual(float(fb), float(fs), delta=0.05)
+        self.assertAlmostEqual(float(fb), 2 * h.expected_cost_bps() + 0.5, delta=0.05)
+        # raw locked edge: SELL Arcus at its ask vs BUY Lighter at 235.52 looks terrible; neutral removes the basis
+        raw = h.locked_edge_bps(SELL, D("235.09"), D("235.085"), neutral=False)
+        neu = h.locked_edge_bps(SELL, D("235.09"), D("235.085"), neutral=True)
+        self.assertLess(raw, D("-15"))
+        self.assertGreater(neu, raw + D("10"))
+        # a glitch (240bps) must not poison the basis
+        feed.handle(self._lighter_snapshot(bid="240.0", ask="240.5", n=500))
+        feed.last_bbo_ts = clock.t
+        before = h.basis_ema
+        h.observe(clock.t + 1, D("235.08"), D("235.09"))
+        self.assertEqual(h.basis_ema, before)
+        # richer-than-usual Lighter -> BUY needs less edge, SELL more
+        feed.handle(self._lighter_snapshot(bid="235.40", ask="235.62", n=900))
+        feed.last_bbo_ts = clock.t + 2
+        h.observe(clock.t + 2, D("235.08"), D("235.09"))
+        fb2, fs2 = h.edge_floors()
+        self.assertLess(fb2, fs2)
+
+    async def test_38_bot_blocks_adds_when_lighter_feed_stale_and_sets_floors(self):
+        bot, s, clock = sim.make(HEDGE_ENABLED="1", LIGHTER_MARKET_ID="1", EXTRA_LEVELS=0, MIN_REQUOTE_S="0.1",
+                                 HEDGE_FEED_STALE_S="3")
+        feed, h = self._mk_hedger(bot, clock)
+        bot.hedger = h
+        bot._hedge_feed = feed
+        for _ in range(3):
+            feed.last_bbo_ts = clock.t
+            await sim.step(bot, s, clock, "80000.0", "80080.0", dt=1.0)
+        self.assertNotEqual(bot.engine.hedge_edge_floor[BUY], D("0"))
+        feed.last_bbo_ts = clock.t - 60.0                       # stale
+        for _ in range(3):
+            await sim.step(bot, s, clock, "80000.0", "80080.0", dt=1.0)
+        live = [o for o in bot.om.orders.values() if not o.is_taker]
+        self.assertFalse(live, "no adds while the hedge venue is stale")
+
+    async def test_39_maker_first_hedge_fill_timeout_and_queue(self):
+        import json as _j
+        async def run(bid, ask, trades, timeout="0.3", qty="1.0"):
+            bot, s, clock = sim.make(HEDGE_ENABLED="1", LIGHTER_MARKET_ID="1", HEDGE_MODE="paper", HEDGE_STYLE="maker_first",
+                                     HEDGE_MAKER_TIMEOUT_S=timeout, HEDGE_MAKER_LATENCY_MS="1", HEDGE_LATENCY_MS="1",
+                                     HEDGE_MIN_USD="1", DRY_RUN="1", HEDGE_MAKER_IMPROVE="0.33")
+            feed, h = self._mk_hedger(bot, clock)
+            feed.handle(_j.dumps({"type": "subscribed/order_book", "order_book": {"nonce": 1, "bids": [{"price": bid, "size": "5"}],
+                                  "asks": [{"price": ask, "size": "5"}]}}))
+            feed.last_bbo_ts = clock.t
+            bot.ledger.position = D(qty)
+            task = asyncio.create_task(h.tick(clock.t))
+            for delay, tr in trades:
+                await asyncio.sleep(delay)
+                feed.handle(_j.dumps({"type": "update/trade", "trades": [tr]}))
+            await task
+            return h
+        # 1) a buyer lifts through our resting ask inside the spread -> maker fill at 235.45, no taker, negative cost
+        h = await run("235.30", "235.52", [(0.05, {"price": "235.46", "size": "2", "is_maker_ask": True})])
+        self.assertEqual(h.position, D("-1.0"))
+        self.assertEqual((h.maker_qty, h.taker_qty), (D("1.0"), D("0")))
+        self.assertLess(h.cost_cross_usd, 0)
+        self.assertEqual(h.feed.book.bbo()[1], D("235.52"))
+        # 2) nobody trades -> after the timeout the rest is crossed
+        h = await run("235.30", "235.52", [])
+        self.assertEqual(h.position, D("-1.0"))
+        self.assertEqual((h.maker_qty, h.taker_qty), (D("0"), D("1.0")))
+        # 3) one-tick spread -> we only JOIN the touch behind 5 shares: 3 + 3 traded => 1 left for us
+        h = await run("235.30", "235.31", [(0.05, {"price": "235.31", "size": "3", "is_maker_ask": True}),
+                                           (0.05, {"price": "235.31", "size": "3", "is_maker_ask": True})], timeout="0.5")
+        self.assertEqual(h.maker_qty, D("1.0"))
+        h = await run("235.30", "235.31", [(0.05, {"price": "235.31", "size": "3", "is_maker_ask": True})], timeout="0.3")
+        self.assertEqual(h.maker_qty, D("0"), "queue ahead not consumed -> no maker fill")
+        self.assertEqual(h.taker_qty, D("1.0"))
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,

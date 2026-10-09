@@ -15,6 +15,7 @@ from typing import Any, Optional
 from config import Config
 from exchange import Exchange
 from feeds import CrossFeedManager
+from lighter import LighterFeed, LighterHedger, make_live_client
 from market import Market, MarketData
 from signer import Signer
 from ledger import Ledger, Fill
@@ -107,6 +108,9 @@ class MarketMaker:
         self._bg_tasks: dict = {}
         self._last_ext_wake = 0.0
         self._cross_feeds = None
+        self.hedger = None
+        self._hedge_feed = None
+        self._hedge_task = None
         self._last_cross_log = 0.0
         self._dms_armed = False
         self._dms_fail = 0
@@ -298,6 +302,28 @@ class MarketMaker:
             except Exception:
                 pass
         self._files.clear()
+
+    async def _start_hedger(self) -> None:
+        """HEDGE_ENABLED=1: Lighter RH data feed + hedge executor (paper by default; live needs HEDGE_MODE=live and keys)."""
+        try:
+            client = None
+            if self.cfg.hedge_mode == "live" and not self.cfg.dry_run:
+                client = make_live_client(self.cfg)
+            self._hedge_feed = LighterFeed(self, self.cfg, None, self.now)
+            self.hedger = LighterHedger(self.cfg, self._hedge_feed, self._hedge_arcus_pos,
+                                        lambda: self.md.mid, client, self.now)
+            self._hedge_task = asyncio.create_task(self._hedge_feed.run())
+            log.info("HEDGE enabled: mode=%s venue=Lighter RH symbol=%s ratio=%s min=$%s budget=%s tx/min",
+                     self.hedger.mode, self._hedge_feed.symbol, self.cfg.hedge_ratio, self.cfg.hedge_min_usd,
+                     self.cfg.hedge_max_tx_per_min)
+        except Exception as e:
+            self.hedger = None
+            log.error("HEDGE could not start (%s) - running WITHOUT hedge", e)
+
+    def _hedge_arcus_pos(self) -> Decimal:
+        m = self._get_market()
+        p = self.ledger.position
+        return p if abs(p) >= m.min_size else ZERO
 
     def _spawn_bg(self, name: str, coro_fn, now: float) -> None:
         """Run slow network housekeeping off the quoting loop (one in flight per name)."""
@@ -513,6 +539,34 @@ class MarketMaker:
                 if pos_usd <= 0:
                     sell_blocked = True
 
+            if self.hedger is not None and self.hedger.enabled:
+                hnow = self.now()
+                self.hedger.observe(hnow, self.md.bid, self.md.ask)
+                why = self.hedger.add_block_reason(hnow)
+                if why:
+                    if pos_usd >= 0:
+                        buy_blocked = True
+                    if pos_usd <= 0:
+                        sell_blocked = True
+                    if hnow - self._last_pause_log.get("hedge", 0.0) > 30.0:
+                        self._last_pause_log["hedge"] = hnow
+                        log.warning("HEDGE gate: %s -> not adding", why)
+                if self.cfg.hedge_edge_floor and self.hedger.basis_ema is not None:
+                    fb, fs = self.hedger.edge_floors()
+                    self.engine.hedge_edge_floor = {BUY: fb, SELL: fs}
+                else:
+                    self.engine.hedge_edge_floor = {BUY: ZERO, SELL: ZERO}
+                if self.cfg.hedge_edge_gate and mid:
+                    thr = self.cfg.hedge_min_locked_edge_bps
+                    e_sell = self.hedger.locked_edge_bps(SELL, self.md.ask, mid)
+                    e_buy = self.hedger.locked_edge_bps(BUY, self.md.bid, mid)
+                    if e_sell is not None and e_sell < thr and pos_usd <= 0:
+                        sell_blocked = True
+                    if e_buy is not None and e_buy < thr and pos_usd >= 0:
+                        buy_blocked = True
+            else:
+                self.engine.hedge_edge_floor = {BUY: ZERO, SELL: ZERO}
+
             if self.cfg.oracle_guard and m.mark and mid and (self.now() - self.md.info_ts) <= max(15.0, 3 * self.cfg.market_refresh_s):
                 dev = (m.mark - mid) / mid * BPS          # >0: oracle above the book -> price likely to rise
                 if dev >= self.cfg.oracle_guard_bps and pos_usd <= 0:
@@ -679,6 +733,13 @@ class MarketMaker:
                  fmt(mk) if mk else "-", ("%+.2f" % float(dev)) if dev is not None else "-",
                  fmt(self.ledger.position), float(self.ledger.unrealized(mid)),
                  float(self.ledger.total_pnl(mid)), self.om.describe(now))
+        if self.hedger is not None and self.hedger.enabled:
+            comb = self.hedger.combined_pnl(self.ledger.total_pnl(mid))
+            log.info("HEDGE | %s | combined_pnl=$%.4f (arcus $%.4f)", self.hedger.describe(now), float(comb),
+                     float(self.ledger.total_pnl(mid)))
+            rep = self.hedger.report(now)
+            if rep:
+                log.info(rep)
         if self.cfg.enable_cross_exchange and self.cfg.cross_feed:
             cr = self.md.cross
             fr = cr.fresh(now)
@@ -740,6 +801,9 @@ class MarketMaker:
             self._cross_feeds = CrossFeedManager(self.cfg, self)
             self._cross_feeds.start()
 
+        if self.cfg.hedge_enabled and self.hedger is None:
+            await self._start_hedger()
+
         reconnect_delay = 1.0
         max_reconnect_delay = 15.0
 
@@ -780,6 +844,8 @@ class MarketMaker:
                         self._spawn_bg("reconcile", self._reconcile, now)
                         self._spawn_bg("mktinfo", self._refresh_market_info, now)
                         self._status_log(now)
+                        if self.hedger is not None:
+                            self._spawn_bg("hedge", self.hedger.tick, now)
 
                         await self.tick()
 
@@ -820,6 +886,17 @@ class MarketMaker:
             await self.om.cancel_all()
         except Exception:
             pass
+        if self.hedger is not None:
+            try:
+                self._hedge_feed.stop()
+                if self._hedge_task:
+                    self._hedge_task.cancel()
+                log.info("HEDGE shutdown: %s | %s", self.hedger.describe(self.now()), self.hedger.report(self.now(), force=True))
+                if abs(self.hedger.position) > 0:
+                    log.warning("Lighter hedge position left open: %s (Arcus position %s) - manage it manually if the bot stays off",
+                                self.hedger.position, self.ledger.position)
+            except Exception:
+                pass
         if self._cross_feeds is not None:
             try:
                 await self._cross_feeds.stop()
