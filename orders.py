@@ -101,6 +101,16 @@ class OrderManager:
         retry = retry or resp.get("retryAfterMs")
         if resp.get("status") == 429 and retry:
             self.paused_until = now + float(retry) / 1000 + 0.1
+        code = err.get("code") if isinstance(err, dict) else None
+        if code == 23000:
+            log.warning("VOLUME QUOTA EXHAUSTED (code 23000) - backing off order actions for 10s")
+            self.paused_until = max(self.paused_until, now + 10.0)
+            self._actions.clear()
+        elif code == 21104:
+            log.warning("INVALID NONCE (code 21104) - resynchronizing nonce generator")
+            if hasattr(self.signer, "next_ts"):
+                self.signer._last_ts = max(time.time_ns(), getattr(self.signer, "_last_ts", 0) + 50_000_000)
+            self.paused_until = max(self.paused_until, now + 1.5)
         if self._consec_errors >= 8:
             log.error("too many consecutive errors - pausing 30s")
             self.paused_until = now + 30
@@ -167,7 +177,11 @@ class OrderManager:
         resp = await self.ex.write(req)
         if not self._ok(resp):
             self._error(f"modify L{o.pair_index} {o.side}", resp, now)
-            await self.cancel(o, now)
+            err = resp.get("error")
+            code = err.get("code") if isinstance(err, dict) else None
+            # If quota exhausted or invalid nonce, sending cancel will just fail and spam; let order rest
+            if code not in (23000, 21104):
+                await self.cancel(o, now)
             return False
         self._consec_errors = 0
         self.n_modify += 1
@@ -298,6 +312,19 @@ class OrderManager:
                     o_new.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
             return
 
+        m = self.get_market()
+        is_exit = bool(getattr(t, "is_exit_quote", False))
+
+        # Check if unwind quantity mismatch (accumulated further fills: must resize!)
+        qty_mismatch = abs(t.qty - existing.remaining) >= (m.step * Decimal("0.5"))
+        if is_exit and qty_mismatch:
+            await self.cancel(existing, now)
+            self.pair_slots.pop(slot, None)
+            await self.place(t.pair_index, t.side, t.price, t.qty, now,
+                             time_in_force="ALO", reduce_only=True,
+                             quote_mid=getattr(t, "quote_mid", None))
+            return
+
         drift = abs(bps_diff(t.price, existing.price))
         is_advancing = (t.side == BUY and t.price > existing.price) or (t.side == SELL and t.price < existing.price)
         is_retreating = not is_advancing
@@ -309,18 +336,20 @@ class OrderManager:
             should_modify = True
             urgent = True
 
-        m = self.get_market()
         tick_bps = (m.tick / existing.price) * Decimal("10000") if existing.price > 0 else Decimal("0.1")
-        eff_retreat = min(self.cfg.retreat_bps, tick_bps * Decimal("0.9"))
-        eff_requote = min(self.cfg.requote_bps, tick_bps * Decimal("0.9"))
+        eff_retreat = max(self.cfg.retreat_bps, tick_bps * Decimal("1.2"))
+        eff_requote = max(self.cfg.requote_bps, tick_bps * Decimal("1.5"))
+        time_since_last = now - existing.last_action
+        min_requote_delay = getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s
 
-        if is_retreating and (drift >= eff_retreat or abs(t.price - existing.price) >= m.tick):
+        # Don't modify on sub-tick or 1-tick jiggles unless drift exceeds threshold or min delay passed
+        if is_retreating and (drift >= eff_retreat):
             should_modify = True
             urgent = True
-        elif is_advancing and (drift >= eff_requote or abs(t.price - existing.price) >= m.tick) and (now - existing.last_action >= (getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s)):
+        elif is_advancing and (drift >= eff_requote) and (time_since_last >= min_requote_delay):
             queue_reset_cost = getattr(self.cfg, "queue_reset_cost_bps", Decimal("0.20"))
             ev_gain = getattr(t, "expected_value_bps", Decimal(0)) - getattr(existing, "ev_bps", Decimal(0))
-            if ev_gain >= queue_reset_cost or drift >= (self.cfg.requote_bps * Decimal("1.5")) or abs(t.price - existing.price) >= m.tick:
+            if ev_gain >= queue_reset_cost or drift >= (eff_requote * Decimal("1.5")):
                 should_modify = True
 
         if should_modify:

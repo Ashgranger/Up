@@ -818,10 +818,12 @@ class Ledger:
         if abs(ex_pos - self.position) <= tol:
             self._mismatch = 0
             return False
-        if now - self.last_fill_ts < 4.0:
+        # Do not wipe internal position if fills occurred within the last 10s (delayed WS feed protection)
+        if now - self.last_fill_ts < 10.0:
             return False
         self._mismatch += 1
-        if self._mismatch < 2:
+        # Require at least 3 consecutive confirming mismatched updates
+        if self._mismatch < 3:
             return False
         old = self.position
         self.position = ex_pos

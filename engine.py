@@ -696,15 +696,15 @@ class MarketMakingEngine:
                             is_exit_quote=True, is_taker=True, quote_mid=mid, est_px=est_px
                         ))
                     else:
-                        min_profit_bps = max(self.cfg.exit_min_profit_bps, Decimal("1.0"))
+                        min_profit_bps = max(self.cfg.exit_min_profit_bps, Decimal("1.5"))
                         hold_time = ledger.hold_s(now)
                         max_hold = self.cfg.max_hold_s
-                        if hold_time <= 10.0:
+                        if hold_time <= 15.0:
                             dynamic_min_profit_bps = min_profit_bps
                         else:
-                            decay_span = max(10.0, max_hold * 0.5)
-                            decay = max(Decimal("0.0"), Decimal("1.0") - Decimal(str((hold_time - 10.0) / decay_span)))
-                            dynamic_min_profit_bps = max(min_profit_bps * decay, Decimal("0.2"))
+                            decay_span = max(15.0, max_hold * 0.6)
+                            decay = max(Decimal("0.0"), Decimal("1.0") - Decimal(str((hold_time - 15.0) / decay_span)))
+                            dynamic_min_profit_bps = max(min_profit_bps * decay, Decimal("0.6"))
 
                         min_profit_px = ledger.avg_cost * (ONE - dynamic_min_profit_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.bid
                         breakeven_px = ledger.avg_cost * (ONE - self.cfg.maker_fee_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.bid
@@ -949,15 +949,15 @@ class MarketMakingEngine:
                             is_exit_quote=True, is_taker=True, quote_mid=mid, est_px=est_px
                         ))
                     else:
-                        min_profit_bps = max(self.cfg.exit_min_profit_bps, Decimal("1.0"))
+                        min_profit_bps = max(self.cfg.exit_min_profit_bps, Decimal("1.5"))
                         hold_time = ledger.hold_s(now)
                         max_hold = self.cfg.max_hold_s
-                        if hold_time <= 10.0:
+                        if hold_time <= 15.0:
                             dynamic_min_profit_bps = min_profit_bps
                         else:
-                            decay_span = max(10.0, max_hold * 0.5)
-                            decay = max(Decimal("0.0"), Decimal("1.0") - Decimal(str((hold_time - 10.0) / decay_span)))
-                            dynamic_min_profit_bps = max(min_profit_bps * decay, Decimal("0.2"))
+                            decay_span = max(15.0, max_hold * 0.6)
+                            decay = max(Decimal("0.0"), Decimal("1.0") - Decimal(str((hold_time - 15.0) / decay_span)))
+                            dynamic_min_profit_bps = max(min_profit_bps * decay, Decimal("0.6"))
 
                         min_profit_px = ledger.avg_cost * (ONE + dynamic_min_profit_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.ask
                         breakeven_px = ledger.avg_cost * (ONE + self.cfg.maker_fee_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.ask
