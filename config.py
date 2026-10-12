@@ -152,39 +152,6 @@ class Config:
     maker_exit_min_prob: float
     taker_hard_stop_bps: Decimal
     oracle_guard: bool
-    hedge_enabled: bool
-    hedge_mode: str
-    lighter_url: str
-    lighter_ws_url: str
-    lighter_symbol: str
-    lighter_market_id: str
-    lighter_account_index: int
-    lighter_api_key_index: int
-    lighter_api_private_key: str
-    hedge_ratio: Decimal
-    hedge_min_usd: Decimal
-    hedge_max_age_s: float
-    hedge_slippage_bps: Decimal
-    hedge_max_tx_per_min: int
-    hedge_max_unhedged_usd: Decimal
-    hedge_feed_stale_s: float
-    hedge_latency_ms: float
-    hedge_edge_gate: bool
-    hedge_min_locked_edge_bps: Decimal
-    hedge_confirm_timeout_s: float
-    hedge_max_fails: int
-    hedge_basis_halflife_s: float
-    hedge_basis_glitch_bps: float
-    hedge_target_edge_bps: Decimal
-    hedge_cost_mult: Decimal
-    hedge_anchor_weight: Decimal
-    hedge_edge_floor: bool
-    hedge_style: str
-    hedge_required: bool
-    hedge_maker_improve: Decimal
-    hedge_maker_timeout_s: float
-    hedge_maker_latency_ms: float
-    hedge_cancel_settle_s: float
     oracle_guard_bps: Decimal
     enable_dynamic_sizing: bool
     dyn_size_min: Decimal
@@ -223,6 +190,27 @@ class Config:
     quote_dataset_path: str
     enable_empirical_learner: bool
     empirical_prior_weight: int
+    # --- Level 2 & Level 3 Quantitative MM Architecture ------------------- #
+    enable_latent_state: bool
+    enable_belief_state_quoting: bool
+    enable_robust_optimizer: bool
+    robust_epsilon: float
+    enable_market_impact_kernel: bool
+    impact_eta_bps_per_usd: float
+    impact_gamma_decay_s: float
+    enable_cross_asset_hedger: bool
+    cross_asset_rho: float
+    enable_meta_learner: bool
+    # --- Level 4 Advanced Research Architecture --------------------------- #
+    enable_level4_control: bool
+    enable_active_withdrawal: bool
+    withdrawal_hold_s: float
+    enable_mean_field_competition: bool
+    competitor_base_elasticity: float
+    enable_causal_impact: bool
+    enable_risk_budget_allocator: bool
+    risk_total_budget_usd: float
+    risk_cvar_lambda: float
 
     # --- risk -------------------------------------------------------------- #
     session_max_loss_usd: Decimal
@@ -355,39 +343,6 @@ class Config:
             maker_exit_min_prob=float(_e("MAKER_EXIT_MIN_PROB", "0.55")),
             taker_hard_stop_bps=_d("TAKER_HARD_STOP_BPS", "0"),
             oracle_guard=_b("ORACLE_GUARD", "0"),
-            hedge_enabled=_b("HEDGE_ENABLED", "0"),
-            hedge_mode=str(_e("HEDGE_MODE", "paper")).lower(),
-            lighter_url=str(_e("LIGHTER_URL", "https://api.rh.lighter.xyz")).rstrip("/"),
-            lighter_ws_url=str(_e("LIGHTER_WS_URL", "wss://api.rh.lighter.xyz/stream")),
-            lighter_symbol=str(_e("LIGHTER_SYMBOL", "")),
-            lighter_market_id=str(_e("LIGHTER_MARKET_ID", "")),
-            lighter_account_index=int(_e("LIGHTER_ACCOUNT_INDEX", "-1")),
-            lighter_api_key_index=int(_e("LIGHTER_API_KEY_INDEX", "4")),
-            lighter_api_private_key=str(_e("LIGHTER_API_PRIVATE_KEY", "")),
-            hedge_ratio=_d("HEDGE_RATIO", "1.0"),
-            hedge_min_usd=_d("HEDGE_MIN_USD", "25"),
-            hedge_max_age_s=float(_e("HEDGE_MAX_AGE_S", "20")),
-            hedge_slippage_bps=_d("HEDGE_SLIPPAGE_BPS", "8"),
-            hedge_max_tx_per_min=int(_e("HEDGE_MAX_TX_PER_MIN", "30")),
-            hedge_max_unhedged_usd=_d("HEDGE_MAX_UNHEDGED_USD", "300"),
-            hedge_feed_stale_s=float(_e("HEDGE_FEED_STALE_S", "3")),
-            hedge_latency_ms=float(_e("HEDGE_LATENCY_MS", "350")),
-            hedge_edge_gate=_b("HEDGE_EDGE_GATE", "0"),
-            hedge_min_locked_edge_bps=_d("HEDGE_MIN_LOCKED_EDGE_BPS", "0.0"),
-            hedge_confirm_timeout_s=float(_e("HEDGE_CONFIRM_TIMEOUT_S", "5")),
-            hedge_max_fails=int(_e("HEDGE_MAX_FAILS", "3")),
-            hedge_basis_halflife_s=float(_e("HEDGE_BASIS_HALFLIFE_S", "300")),
-            hedge_basis_glitch_bps=float(_e("HEDGE_BASIS_GLITCH_BPS", "30")),
-            hedge_target_edge_bps=_d("HEDGE_TARGET_EDGE_BPS", "0.5"),
-            hedge_cost_mult=_d("HEDGE_COST_MULT", "2.0"),
-            hedge_anchor_weight=_d("HEDGE_ANCHOR_WEIGHT", "1.0"),
-            hedge_edge_floor=_b("HEDGE_EDGE_FLOOR", "1"),
-            hedge_style=str(_e("HEDGE_STYLE", "taker")).lower(),
-            hedge_required=_b("HEDGE_REQUIRED", "1"),
-            hedge_maker_improve=_d("HEDGE_MAKER_IMPROVE", "0.33"),
-            hedge_maker_timeout_s=float(_e("HEDGE_MAKER_TIMEOUT_S", "2.5")),
-            hedge_maker_latency_ms=float(_e("HEDGE_MAKER_LATENCY_MS", "200")),
-            hedge_cancel_settle_s=float(_e("HEDGE_CANCEL_SETTLE_S", "0.6")),
             oracle_guard_bps=_d("ORACLE_GUARD_BPS", "3.0"),
             enable_dynamic_sizing=_b("ENABLE_DYNAMIC_SIZING", "0"),
             dyn_size_min=_d("DYN_SIZE_MIN", "0.25"),
@@ -424,6 +379,25 @@ class Config:
             quote_dataset_path=str(_e("QUOTE_DATASET_PATH", f"quotes_{'paper' if dry else 'live'}_{market}.jsonl")),
             enable_empirical_learner=_b("ENABLE_EMPIRICAL_LEARNER", "1"),
             empirical_prior_weight=int(_e("EMPIRICAL_PRIOR_WEIGHT", 5)),
+            enable_latent_state=_b("ENABLE_LATENT_STATE", "1"),
+            enable_belief_state_quoting=_b("ENABLE_BELIEF_STATE_QUOTING", "0"),
+            enable_robust_optimizer=_b("ENABLE_ROBUST_OPTIMIZER", "0"),
+            robust_epsilon=float(_e("ROBUST_EPSILON", "0.20")),
+            enable_market_impact_kernel=_b("ENABLE_MARKET_IMPACT_KERNEL", "0"),
+            impact_eta_bps_per_usd=float(_e("IMPACT_ETA_BPS_PER_USD", "0.0002")),
+            impact_gamma_decay_s=float(_e("IMPACT_GAMMA_DECAY_S", "0.15")),
+            enable_cross_asset_hedger=_b("ENABLE_CROSS_ASSET_HEDGER", "0"),
+            cross_asset_rho=float(_e("CROSS_ASSET_RHO", "0.95")),
+            enable_meta_learner=_b("ENABLE_META_LEARNER", "0"),
+            enable_level4_control=_b("ENABLE_LEVEL4_CONTROL", "0"),
+            enable_active_withdrawal=_b("ENABLE_ACTIVE_WITHDRAWAL", "0"),
+            withdrawal_hold_s=float(_e("WITHDRAWAL_HOLD_S", 5.0)),
+            enable_mean_field_competition=_b("ENABLE_MEAN_FIELD_COMPETITION", "0"),
+            competitor_base_elasticity=float(_e("COMPETITOR_BASE_ELASTICITY", 0.60)),
+            enable_causal_impact=_b("ENABLE_CAUSAL_IMPACT", "0"),
+            enable_risk_budget_allocator=_b("ENABLE_RISK_BUDGET_ALLOCATOR", "0"),
+            risk_total_budget_usd=float(_e("RISK_TOTAL_BUDGET_USD", 10.0)),
+            risk_cvar_lambda=float(_e("RISK_CVAR_LAMBDA", 0.50)),
             session_max_loss_usd=_d("SESSION_MAX_LOSS_USD", "0.35"),
             halt_exit=_b("HALT_EXIT", "1"),
             requote_bps=_d("REQUOTE_BPS", "1"),

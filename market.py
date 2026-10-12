@@ -382,6 +382,10 @@ class MarketData:
         self.next_funding_time: float = 0.0
         # Own-order exclusion: provider returns [(side, price, remaining_qty)] of our RESTING maker orders.
         self.own_provider = None
+        from latent_state import LatentStateEstimator, BeliefState, LatentState
+        self.latent_estimator = LatentStateEstimator(cfg)
+        self.belief_state: BeliefState = self.latent_estimator.belief
+        self.latent_state: LatentState = self.latent_estimator.state
 
     # ---------------- own-order exclusion ----------------
     @property
@@ -473,6 +477,31 @@ class MarketData:
                 self._hist.popleft()
             move = self.move_bps(self.cfg.vol_window_s, now)
             self._vol_ewma = move if self._vol_ewma == 0 else self._vol_ewma * Decimal("0.9") + move * Decimal("0.1")
+        if getattr(self.cfg, "enable_latent_state", True) and self.mid:
+            try:
+                tfi_1s = float(self.trade_flow_imbalance(1.0, now))
+                tfi_5s = float(self.trade_flow_imbalance(5.0, now))
+                tfi_10s = float(self.trade_flow_imbalance(10.0, now))
+                obi = float(self.obi)
+                flow_accel = float(self.trade_flow_acceleration(now))
+                vol_bps = float(self.vol_bps)
+                spread_bps = float(self.spread_bps)
+                fragility_buy = float(self.liquidity_fragility("BUY", now))
+                fragility_sell = float(self.liquidity_fragility("SELL", now))
+                feed_age_s = float(now - self.ts) if self.ts > 0 else 0.0
+                is_jump = self.jump_active(now)
+                cross_div_bps = float(self.cross.lead_lag_divergence_bps(self.mid, now)) if (self.cross and self.cross.venues) else 0.0
+                cross_vel_bps = float(self.cross.cross_velocity_bps(3.0, now)) if (self.cross and self.cross.venues) else 0.0
+
+                self.belief_state, self.latent_state = self.latent_estimator.update(
+                    tfi_1s=tfi_1s, tfi_5s=tfi_5s, tfi_10s=tfi_10s, obi=obi,
+                    flow_accel=flow_accel, vol_bps=vol_bps, spread_bps=spread_bps,
+                    fragility_buy=fragility_buy, fragility_sell=fragility_sell,
+                    feed_age_s=feed_age_s, is_jump=is_jump, cross_div_bps=cross_div_bps,
+                    cross_vel_bps=cross_vel_bps, now=now,
+                )
+            except Exception:
+                pass
 
     def on_trade(self, side: str, size: Decimal, price: Decimal, now: float) -> None:
         self._trades.append((now, side.upper(), size, price))

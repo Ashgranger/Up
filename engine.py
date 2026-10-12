@@ -35,7 +35,50 @@ class MarketMakingEngine:
         self.cfg = cfg
         self._chase_top_until: float = 0.0
         self._chase_bottom_until: float = 0.0
-        self.hedge_edge_floor = {BUY: ZERO, SELL: ZERO}   # bps from fair; set by the bot when HEDGE is on (see LighterHedger.edge_floors)
+
+        from optimizer import MarketImpactKernel, CrossAssetHedger, RobustQuoteOptimizer
+        from markout_model import ConditionalMarkoutModel, CounterfactualExecutionEngine
+        from meta_learner import HierarchicalMetaLearner
+
+        self.impact_kernel = MarketImpactKernel(
+            eta_0_bps_per_usd=getattr(cfg, "impact_eta_bps_per_usd", 0.0002),
+            gamma_decay_s=getattr(cfg, "impact_gamma_decay_s", 0.15)
+        )
+        self.hedger = CrossAssetHedger(
+            correlation_rho=getattr(cfg, "cross_asset_rho", 0.95),
+            hedge_taker_fee_bps=float(getattr(cfg, "taker_fee_bps", Decimal("2.0")))
+        )
+        self.robust_optimizer = RobustQuoteOptimizer(
+            self.impact_kernel,
+            self.hedger,
+            robust_epsilon=getattr(cfg, "robust_epsilon", 0.20)
+        )
+        self.markout_model = ConditionalMarkoutModel(
+            prior_weight=getattr(cfg, "empirical_prior_weight", 5)
+        )
+        self.counterfactual_engine = CounterfactualExecutionEngine(self.markout_model)
+        self.meta_learner = HierarchicalMetaLearner(cfg)
+        self.last_hedge_recommendation: Optional[Tuple[float, float, str, float]] = None
+
+        # Level 4 Advanced Research Components
+        from level4_control import OptimalStoppingWithdrawalController, RecedingHorizonQuoteController, LatencyState
+        from mean_field_competition import MeanFieldCompetitionEngine
+        from causal_impact import CausalMarketImpactEstimator
+        from tail_risk_budget import RiskBudgetAllocator
+
+        self.latency_state = LatencyState()
+        self.withdrawal_controller = OptimalStoppingWithdrawalController(
+            withdrawal_hold_s=getattr(cfg, "withdrawal_hold_s", 5.0)
+        )
+        self.receding_horizon_controller = RecedingHorizonQuoteController()
+        self.competition_engine = MeanFieldCompetitionEngine(
+            base_elasticity=getattr(cfg, "competitor_base_elasticity", 0.60)
+        )
+        self.causal_estimator = CausalMarketImpactEstimator()
+        self.risk_allocator = RiskBudgetAllocator(
+            total_budget_usd=getattr(cfg, "risk_total_budget_usd", 10.0),
+            cvar_lambda=getattr(cfg, "risk_cvar_lambda", 0.50)
+        )
 
     def compute_fair_value(self, md: MarketData, now: float, ledger: Optional[Ledger] = None) -> Decimal:
         base_mid = md.mid
@@ -76,7 +119,11 @@ class MarketMakingEngine:
             if basis != ZERO:
                 basis_shift = -base_mid * (basis / BPS) * Decimal("0.05")
 
-        fair_val = micro + obi_shift + tfi_shift + cross_shift + cross_obi_shift + basis_shift
+        if getattr(self.cfg, "enable_belief_state_quoting", False) and hasattr(md, "latent_estimator"):
+            regime_shift = md.latent_estimator.compute_regime_adjusted_fair_shift(half_spr, obi, tfi, alpha, beta)
+            fair_val = micro + regime_shift + cross_shift + cross_obi_shift + basis_shift
+        else:
+            fair_val = micro + obi_shift + tfi_shift + cross_shift + cross_obi_shift + basis_shift
         if md.bid and md.ask and md.bid < md.ask:
             fair_val = clamp(fair_val, md.bid, md.ask)
         return fair_val
@@ -353,6 +400,30 @@ class MarketMakingEngine:
         return float(max(0.02, min(0.98, blended_p)))
 
 
+
+    def compute_optimal_quote_surface(self, md: MarketData, pos_usd: Decimal, now: float) -> Dict[str, Any]:
+        """Exposes the precomputed / online optimal quote surface f(q, alpha, sigma, ...)."""
+        mid = md.mid or ZERO
+        fair_val = self.compute_fair_value(md, now)
+        belief = getattr(md, "belief_state", None)
+        if belief is None:
+            from latent_state import BeliefState
+            belief = BeliefState()
+        return self.robust_optimizer.compute_optimal_surface(
+            mid=mid,
+            fair_val=fair_val,
+            pos_usd=pos_usd,
+            max_pos_usd=self.cfg.max_position_usd,
+            vol_bps=md.vol_bps,
+            belief=belief,
+            base_edge_bps=self.cfg.min_edge_bps,
+            skew_rate_bps=self.cfg.skew_bps,
+            order_usd=self.cfg.order_usd,
+            tick=Decimal("0.1"),
+            step=Decimal("0.00001"),
+            now=now
+        )
+
     def generate_ladder_quotes(
         self,
         m: Market,
@@ -398,6 +469,70 @@ class MarketMakingEngine:
         base_edge_bps = min_edge + vol_k * md.vol_bps
         if is_toxic:
             base_edge_bps = base_edge_bps * tox_spread_mult
+
+        # Level 2 & 3 Belief-State & Robust Optimizer Adjustments
+        from latent_state import MarketRegime
+        belief_spr_mult, belief_sz_mult, unc_penalty_bps = ONE, ONE, ZERO
+        if getattr(self.cfg, "enable_belief_state_quoting", False) and hasattr(md, "latent_estimator"):
+            belief_spr_mult, belief_sz_mult, unc_penalty_bps = md.latent_estimator.compute_regime_quote_multipliers()
+
+        meta_spr_mult, meta_sz_mult, is_degraded, degraded_why = ONE, ONE, False, ""
+        if getattr(self.cfg, "enable_meta_learner", False):
+            self.meta_learner.update_context(float(md.vol_bps), float(md.spread_bps), now)
+            meta_spr_mult, meta_sz_mult, is_degraded, degraded_why = self.meta_learner.get_hierarchical_adjustments(md.belief_state, now)
+            if is_degraded:
+                log.warning("CALIBRATION DEGRADED (%s): widening quotes and haircutting sizes", degraded_why)
+
+        impact_pen_buy, impact_pen_sell = ZERO, ZERO
+        if getattr(self.cfg, "enable_market_impact_kernel", False):
+            impact_pen_buy = self.impact_kernel.predict_impact_penalty("BUY", float(self.cfg.order_usd), now)
+            impact_pen_sell = self.impact_kernel.predict_impact_penalty("SELL", float(self.cfg.order_usd), now)
+
+        if getattr(self.cfg, "enable_cross_asset_hedger", False):
+            hedge_h, p_var, hedge_status = self.hedger.evaluate_optimal_hedge(float(pos_usd), 0.0)
+            if hedge_status == "hedge_recommended" and abs(hedge_h) > 0:
+                self.last_hedge_recommendation = (hedge_h, p_var, hedge_status, now)
+
+        # --- Level 4 Optimal Stopping & Active Liquidity Withdrawal ---
+        from level4_control import DecisionState, QuotingMode
+        q_mode = QuotingMode.NORMAL_QUOTING
+        if getattr(self.cfg, "enable_active_withdrawal", False):
+            unreal_bps = (mid - ledger.avg_cost) / ledger.avg_cost * BPS if (ledger.avg_cost and ledger.avg_cost > ZERO and pos_eff != ZERO) else ZERO
+            d_state = DecisionState(
+                belief=md.belief_state,
+                epistemic_uncertainty=float(md.belief_state.uncertainty),
+                inventory_usd=pos_usd,
+                inventory_qty=pos_eff,
+                context_markout_rmse=self.meta_learner.context.markout_rmse_bps,
+                context_brier_score=self.meta_learner.context.fill_prob_brier_score,
+                latency=self.latency_state,
+                timestamp=now,
+            )
+            q_mode, q_reason = self.withdrawal_controller.evaluate_modes(
+                d_state,
+                expected_spread_capture_bps=spr_bps * Decimal("0.5"),
+                expected_adverse_move_bps=self.expected_adverse_move(BUY, md, ledger, now),
+                market_spread_bps=spr_bps,
+                vol_bps=md.vol_bps,
+                unrealized_pnl_bps=unreal_bps,
+                now=now,
+            )
+            if q_mode == QuotingMode.WITHDRAWAL:
+                log.info("LEVEL 4 ACTIVE WITHDRAWAL ENGAGED: %s (canceling quotes)", q_reason)
+                return []
+
+        # --- Level 4 Risk-Budget Allocation ---
+        risk_budget_sz_mult = ONE
+        if getattr(self.cfg, "enable_risk_budget_allocator", False):
+            is_shock = (md.belief_state.dominant_regime == MarketRegime.LIQUIDITY_VACUUM)
+            sz_mult_budget, _, budget_why = self.risk_allocator.evaluate_budget_utilization(
+                inventory_usd=float(pos_usd),
+                vol_bps=float(md.vol_bps),
+                epistemic_uncertainty=float(md.belief_state.uncertainty),
+                latency_rtt_ms=float(self.latency_state.estimated_rtt_ms),
+                is_shock_regime=is_shock,
+            )
+            risk_budget_sz_mult = sz_mult_budget
 
         if self.cfg.enable_cross_exchange and md.cross.venues:
             dispersion = md.cross.cross_dispersion_bps()
@@ -501,10 +636,6 @@ class MarketMakingEngine:
             level_usd_buy = max(level_usd * (ONE - depth_cut_buy) * dyn_buy, m.min_notional)
             level_edge_sell = level_edge + depth_widen_sell
             level_usd_sell = max(level_usd * (ONE - depth_cut_sell) * dyn_sell, m.min_notional)
-            if self.hedge_edge_floor[BUY] > level_edge_buy:
-                level_edge_buy = self.hedge_edge_floor[BUY]
-            if self.hedge_edge_floor[SELL] > level_edge_sell:
-                level_edge_sell = self.hedge_edge_floor[SELL]
 
             # --- BUY SIDE --- #
             is_unwind_buy = (pos_usd < 0)
@@ -646,6 +777,10 @@ class MarketMakingEngine:
                             cand_options = [best_cand_px]
                         else:
                             cand_options = [touch_px, md.bid - tick, model_px]
+                        if getattr(self.cfg, "enable_belief_state_quoting", False) and hasattr(md, "belief_state"):
+                            dom = md.belief_state.dominant_regime
+                            if dom in (MarketRegime.PERSISTENT_SELL, MarketRegime.LIQUIDITY_VACUUM, MarketRegime.UNSTABLE_STALE):
+                                cand_options = [md.bid - tick, model_px]
                         best_cand_px = cand_options[0]
                         best_ev = Decimal("-999999")
                         best_p_fill = 0.5
@@ -669,7 +804,20 @@ class MarketMakingEngine:
                             skew_rate = l.skew_bps if l else self.cfg.skew_bps
                             inv_cost_bps = max(ZERO, (pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate if pos_usd > ZERO else ZERO
                             pred_m = l.predict_markout(BUY, regime, k, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                            c_ev = Decimal(str(c_p)) * (c_cap + pred_m - c_adv) - fee_bps - inv_cost_bps
+                            if getattr(self.cfg, "enable_belief_state_quoting", False) and hasattr(md, "belief_state"):
+                                cf_cand = self.counterfactual_engine.evaluate_candidate(
+                                    pair_index=k, side=BUY, price=c_px, qty=level_usd_buy / c_px,
+                                    fair_val=fair_val, mid=mid, queue_ahead_qty=Decimal(str(md.queue_ahead(BUY, c_px))),
+                                    consumption_rate_qty_s=Decimal(str(md.consumption_rate(BUY, 2.0, now))),
+                                    belief=md.belief_state, pos_usd=pos_usd, target_inv_usd=target_inv_usd,
+                                    max_pos_usd=self.cfg.max_position_usd, skew_rate_bps=skew_rate,
+                                    maker_fee_bps=fee_bps, impact_penalty_bps=impact_pen_buy,
+                                    horizon_s=self.cfg.queue_horizon_s
+                                )
+                                c_ev = cf_cand.net_ev_bps
+                                c_p = cf_cand.p_fill
+                            else:
+                                c_ev = Decimal(str(c_p)) * (c_cap + pred_m - c_adv) - fee_bps - inv_cost_bps
 
                             if c_ev > best_ev:
                                 best_ev = c_ev
@@ -882,6 +1030,10 @@ class MarketMakingEngine:
                             cand_options = [best_cand_px]
                         else:
                             cand_options = [touch_px, md.ask + tick, model_px]
+                        if getattr(self.cfg, "enable_belief_state_quoting", False) and hasattr(md, "belief_state"):
+                            dom = md.belief_state.dominant_regime
+                            if dom in (MarketRegime.PERSISTENT_BUY, MarketRegime.LIQUIDITY_VACUUM, MarketRegime.UNSTABLE_STALE):
+                                cand_options = [md.ask + tick, model_px]
                         best_cand_px = cand_options[0]
                         best_ev = Decimal("-999999")
                         best_p_fill = 0.5
@@ -905,7 +1057,20 @@ class MarketMakingEngine:
                             skew_rate = l.skew_bps if l else self.cfg.skew_bps
                             inv_cost_bps = max(ZERO, -(pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate if pos_usd < ZERO else ZERO
                             pred_m = l.predict_markout(SELL, regime, k, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                            c_ev = Decimal(str(c_p)) * (c_cap + pred_m - c_adv) - fee_bps - inv_cost_bps
+                            if getattr(self.cfg, "enable_belief_state_quoting", False) and hasattr(md, "belief_state"):
+                                cf_cand = self.counterfactual_engine.evaluate_candidate(
+                                    pair_index=k, side=SELL, price=c_px, qty=level_usd_sell / c_px,
+                                    fair_val=fair_val, mid=mid, queue_ahead_qty=Decimal(str(md.queue_ahead(SELL, c_px))),
+                                    consumption_rate_qty_s=Decimal(str(md.consumption_rate(SELL, 2.0, now))),
+                                    belief=md.belief_state, pos_usd=pos_usd, target_inv_usd=target_inv_usd,
+                                    max_pos_usd=self.cfg.max_position_usd, skew_rate_bps=skew_rate,
+                                    maker_fee_bps=fee_bps, impact_penalty_bps=impact_pen_sell,
+                                    horizon_s=self.cfg.queue_horizon_s
+                                )
+                                c_ev = cf_cand.net_ev_bps
+                                c_p = cf_cand.p_fill
+                            else:
+                                c_ev = Decimal(str(c_p)) * (c_cap + pred_m - c_adv) - fee_bps - inv_cost_bps
 
                             if c_ev > best_ev:
                                 best_ev = c_ev

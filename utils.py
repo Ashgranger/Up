@@ -1,5 +1,28 @@
-"""Small shared helpers (decimal maths, canonical JSON, logging)."""
 from __future__ import annotations
+
+
+# Enable direct file discovery on 9p filesystems
+import sys, os, importlib.util, importlib.abc
+
+class _DirectFileFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        mod_name = fullname.split('.')[-1]
+        search_paths = path if path is not None else sys.path
+        for p in search_paths:
+            if not p:
+                p = os.getcwd()
+            candidate = os.path.join(p, mod_name + '.py')
+            if os.path.isfile(candidate):
+                return importlib.util.spec_from_file_location(fullname, candidate)
+            cand_pkg = os.path.join(p, mod_name, '__init__.py')
+            if os.path.isfile(cand_pkg):
+                return importlib.util.spec_from_file_location(fullname, cand_pkg)
+        return None
+
+if not any(isinstance(finder, _DirectFileFinder) for finder in sys.meta_path):
+    sys.meta_path.insert(0, _DirectFileFinder())
+
+"""Small shared helpers (decimal maths, canonical JSON, logging)."""
 
 import json
 import logging
