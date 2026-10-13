@@ -813,18 +813,17 @@ class Ledger:
         avg_m = self._calc_weighted_markout(buf)
         return max(ZERO, -avg_m)
 
-    def reconcile(self, ex_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal) -> bool:
+    def reconcile(self, ex_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal, force: bool = False) -> bool:
         tol = (min_notional / mid) * Decimal("0.25") if mid else Decimal("1e-8")
         if abs(ex_pos - self.position) <= tol:
             self._mismatch = 0
             return False
-        # Do not wipe internal position if fills occurred within the last 10s (delayed WS feed protection)
-        if now - self.last_fill_ts < 10.0:
-            return False
-        self._mismatch += 1
-        # Require at least 3 consecutive confirming mismatched updates
-        if self._mismatch < 3:
-            return False
+        if not force:
+            if now - self.last_fill_ts < 10.0:
+                return False
+            self._mismatch += 1
+            if self._mismatch < 3:
+                return False
         old = self.position
         self.position = ex_pos
         self._mismatch = 0

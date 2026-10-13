@@ -58,6 +58,7 @@ class OrderManager:
         self._consec_errors = 0
         self.last_place_ts = 0.0
         self.maybe_orders = True
+        self.on_reduce_only_rejected = None
         self.n_place = self.n_modify = self.n_cancel = self.n_reject = self.n_actions = 0
 
     def side_orders(self, side: str) -> list[Order]:
@@ -403,17 +404,40 @@ class OrderManager:
             if not real and o.est_px and getattr(self.cfg, "taker_fill_price_mode", "est") == "est":
                 px = o.est_px   # exchange sent no execution price: book the book-walk estimate, NOT our far-through limit
         fill_qty = Decimal(0)
-        rem = c.get("remainingSize")
-        if rem is not None:
+        is_partially_filled = (state == "PARTIALLY_FILLED" or status == "PARTIALLY_FILLED")
+
+        # 1. Prefer cumulative filled size if reported by exchange (Arcus sends "filledSize")
+        cum_filled_raw = c.get("filledSize") or c.get("cumFilled") or c.get("executedQty")
+        if cum_filled_raw is not None:
             try:
-                new_rem = Decimal(str(rem))
-                if new_rem < o.remaining:
-                    fill_qty = o.remaining - new_rem
-                o.remaining = new_rem
+                cum_filled = Decimal(str(cum_filled_raw))
+                prev_filled = getattr(o, "cum_filled", Decimal(0))
+                if cum_filled > prev_filled:
+                    fill_qty = cum_filled - prev_filled
+                    o.cum_filled = cum_filled
+                    o.remaining = max(Decimal(0), o.qty - cum_filled)
+                else:
+                    fill_qty = Decimal(0)
             except Exception:
-                rem = None
-        if filled and rem is None:
-            fill_qty, o.remaining = o.remaining, Decimal(0)
+                fill_qty = Decimal(0)
+        elif filled or is_partially_filled:
+            # Only compute delta from remainingSize if state explicitly confirms an execution!
+            rem = c.get("remainingSize")
+            if rem is not None:
+                try:
+                    new_rem = Decimal(str(rem))
+                    if new_rem < o.remaining:
+                        fill_qty = o.remaining - new_rem
+                    o.remaining = new_rem
+                except Exception:
+                    rem = None
+            if filled and (rem is None or fill_qty == Decimal(0)):
+                fill_qty, o.remaining = o.remaining, Decimal(0)
+
+        # 2. Never book fills if order was canceled or rejected without execution!
+        if (state in ("CANCELED", "REJECTED", "EXPIRED") or status in ("CANCELED", "REJECTED", "EXPIRED")) and not filled and not is_partially_filled:
+            fill_qty = Decimal(0)
+
         if fill_qty > 0:
             o.filled_any = True
             self.on_fill(o.side, fill_qty, px, o)
@@ -428,7 +452,15 @@ class OrderManager:
             self._remove_order(o.order_id)
         elif state in ("CANCELED", "REJECTED") or status in ("CANCELED", "MARGIN_CANCELED", "REJECTED"):
             reason = c.get("rejectionReason") or c.get("cancelReason") or ""
-            if (state == "REJECTED" or status == "REJECTED") and not o.is_taker:
+            if "REDUCE_ONLY" in str(reason).upper():
+                log.warning("ORDER L%d %s REJECTED (%s): exchange position mismatch! Triggering position reconciliation.",
+                            o.pair_index, o.side, reason)
+                if hasattr(self, "on_reduce_only_rejected") and callable(self.on_reduce_only_rejected):
+                    try:
+                        self.on_reduce_only_rejected()
+                    except Exception:
+                        pass
+            elif (state == "REJECTED" or status == "REJECTED") and not o.is_taker:
                 self.n_reject += 1
                 self._backoff(o.side, now)
             log.info("ORDER L%d %s %s %s", o.pair_index, o.side, state or status, reason)

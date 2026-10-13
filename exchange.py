@@ -133,6 +133,32 @@ class Exchange:
             self._fail_all_pending("CONNECTION_CLOSED")
             self.ws = None
 
+
+    async def fetch_account(self) -> Optional[dict]:
+        """REST GET /v1/account per Arcus documentation."""
+        def _get():
+            try:
+                url = f"{self.rest}/v1/account?address={self.cfg.address}&accountIndex={self.cfg.account_index}"
+                req = urllib.request.Request(url, headers={"User-Agent": "Arcus-MM/1.0"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    return json.loads(r.read())
+            except Exception as e:
+                log.debug("fetch_account REST failed: %s", e)
+                return None
+        return await asyncio.to_thread(_get)
+
+    async def fetch_positions(self) -> Optional[dict]:
+        """REST GET /v1/positions fallback."""
+        def _get():
+            try:
+                url = f"{self.rest}/v1/positions?address={self.cfg.address}&accountIndex={self.cfg.account_index}"
+                req = urllib.request.Request(url, headers={"User-Agent": "Arcus-MM/1.0"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    return json.loads(r.read())
+            except Exception:
+                return None
+        return await asyncio.to_thread(_get)
+
     async def fetch_markets(self, market: Optional[str] = None) -> list:
         def _get():
             url = f"{self.rest}/v1/markets" + (f"?market={market}" if market else "")

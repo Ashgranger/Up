@@ -280,6 +280,38 @@ class TestLevel4MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(recovered_buy, "Bot should resume quoting after cooldown and recovery")
         print(f"✓ test_06_joint_optimization_end_to_end passed: Active withdrawal, full quote cancel, and recovery verified.")
 
+    async def test_07_phantom_fill_and_reduce_only_recovery(self):
+        """7. Phantom Fill Prevention & Reduce-Only Recovery:
+        Verifies that cancelled orders with remainingSize=0 never create phantom fills,
+        and REDUCE_ONLY_WOULD_INCREASE immediately triggers forced position sync."""
+        bot, s, clock = sim.make()
+        fills_recorded = []
+        bot.om.on_fill = lambda side, qty, px, o: fills_recorded.append((side, qty, px))
+
+        # 1. Simulate cancelled order with remainingSize=0
+        import orders
+        o = orders.Order('test-1', 0, 'BUY', D('80000'), D('0.1'), D('0.1'), 1000, 0, 0)
+        bot.om.orders['test-1'] = o
+        cancel_msg = {
+            'orderId': 'test-1', 'state': 'CANCELED', 'status': 'CANCELED',
+            'remainingSize': '0', 'filledSize': '0', 'price': '80000'
+        }
+        bot.om.on_update(cancel_msg, 10.0)
+        self.assertEqual(len(fills_recorded), 0, 'Cancelled order must never trigger phantom fill')
+
+        # 2. Simulate REDUCE_ONLY_WOULD_INCREASE rejection
+        reconciled_called = []
+        bot.om.on_reduce_only_rejected = lambda: reconciled_called.append(True)
+        o2 = orders.Order('test-2', 0, 'SELL', D('80010'), D('0.1'), D('0.1'), 1000, 0, 0)
+        bot.om.orders['test-2'] = o2
+        reject_msg = {
+            'orderId': 'test-2', 'state': 'REJECTED', 'status': 'REJECTED',
+            'rejectionReason': 'REDUCE_ONLY_WOULD_INCREASE'
+        }
+        bot.om.on_update(reject_msg, 11.0)
+        self.assertEqual(len(reconciled_called), 1, 'Reduce-only reject must trigger position reconciliation')
+        print('✓ test_07_phantom_fill_and_reduce_only_recovery passed: Zero phantom fills and immediate recovery verified.')
+
 
 if __name__ == "__main__":
     unittest.main()

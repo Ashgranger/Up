@@ -131,15 +131,12 @@ class OptimalStoppingWithdrawalController:
             reasons.append(f"catastrophic_unrealized_loss={unrealized_pnl_bps:.1f}bps")
 
         # 2. Optimal Stopping Value Function Calculation: V_Q(x) vs V_W(x)
-        # Value of quoting: Expected spread capture - expected adverse move - inventory risk
+        # Value of quoting: Expected spread capture - expected adverse move
         v_quote = expected_spread_capture_bps - expected_adverse_move_bps
-        # Value of withdrawing: 0 immediate PnL, but incurs queue priority loss and re-entry costs
-        v_withdraw = -self.queue_priority_loss_bps - self.reentry_penalty_bps
-
-        # If quoting has negative net expected utility worse than withdrawing penalty:
-        if v_quote < v_withdraw:
+        # Hard emergency withdrawal only on severe negative expected utility:
+        if v_quote < Decimal("-4.0"):
             hard_withdraw = True
-            reasons.append(f"negative_expected_utility(v_q={v_quote:.2f}<v_w={v_withdraw:.2f})")
+            reasons.append(f"severe_negative_expected_utility(v_q={v_quote:.2f}<-4.0)")
 
         # 3. State Machine Transitions with Hysteresis
         if hard_withdraw:
@@ -165,6 +162,7 @@ class OptimalStoppingWithdrawalController:
             or vol_bps > Decimal("10.0")
             or x.context_markout_rmse > 2.5
             or x.context_brier_score > 0.25
+            or v_quote < Decimal("0.0")
         )
 
         if is_reduced:
