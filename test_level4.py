@@ -14,6 +14,7 @@ import unittest
 from decimal import Decimal as D
 
 import sim
+import orders
 from latent_state import MarketRegime, BeliefState
 from level4_control import (
     DecisionState,
@@ -311,6 +312,34 @@ class TestLevel4MarketMaker(unittest.IsolatedAsyncioTestCase):
         bot.om.on_update(reject_msg, 11.0)
         self.assertEqual(len(reconciled_called), 1, 'Reduce-only reject must trigger position reconciliation')
         print('✓ test_07_phantom_fill_and_reduce_only_recovery passed: Zero phantom fills and immediate recovery verified.')
+
+    async def test_08_reconcile_signed_short_position_and_hardware_clamp(self):
+        """8. Reconcile Signed Short Position & Hardware Reduce-Only Clamp:
+        Verifies that exchange signed positions (-0.2393776 for SHORT) do NOT flip sign to positive,
+        and hardware clamp in OrderManager prevents reduce_only=True on SELL when short or flat."""
+        bot, s, clock = sim.make()
+        bot.md.info.mark = D('83.50')
+        res = {'positions': [{'marketId': bot.md.info.market_id, 'size': '-0.2393776', 'side': 'SHORT'}]}
+        bot.ex.get = lambda *args, **kwargs: asyncio.sleep(0, result=res)
+        await bot._reconcile_positions(100.0, force=True)
+        self.assertEqual(bot.ledger.position, D('-0.2393776'), 'Position must be SHORT -0.2393776, NOT flipped to positive!')
+
+        # Test hardware clamp
+        target = orders.Order('dummy', 0, SELL, D('83.56'), D('0.2393776'), D('0.2393776'), 1000, 0, 0)
+        target.is_exit_quote = True
+        target.pair_index = 0
+        target.side = SELL
+        target.price = D('83.56')
+        target.qty = D('0.2393776')
+        placed_orders = []
+        async def mock_place(pair_index, side, price, qty, now, time_in_force='ALO', reduce_only=False, **kwargs):
+            placed_orders.append((side, price, qty, reduce_only))
+            return orders.Order('placed-1', pair_index, side, price, qty, qty, 1000, now, now, is_reduce_only=reduce_only)
+        bot.om.place = mock_place
+        await bot.om._sync_one(target, 100.0)
+        self.assertEqual(len(placed_orders), 1)
+        self.assertFalse(placed_orders[0][3], 'Hardware clamp MUST disarm reduce_only on SELL when position is short!')
+        print('✓ test_08_reconcile_signed_short_position_and_hardware_clamp passed: Correct sign reconciliation and clamp verified.')
 
 
 if __name__ == "__main__":

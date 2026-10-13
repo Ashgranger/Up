@@ -91,6 +91,7 @@ class MarketMaker:
         self._pnl_base = ZERO
         self.engine = MarketMakingEngine(cfg)
         self.om = OrderManager(cfg, self.ex, self.signer, self._get_market, self._on_fill)
+        self.om.ledger = self.ledger
         self.om.on_reduce_only_rejected = self._on_reduce_only_rejected
 
         self._recent_fills: deque = deque()
@@ -300,12 +301,12 @@ class MarketMaker:
                 pass
         self._files.clear()
 
-    def _spawn_bg(self, name: str, coro_fn, now: float) -> None:
+    def _spawn_bg(self, name: str, coro_fn, *args, **kwargs) -> None:
         """Run slow network housekeeping off the quoting loop (one in flight per name)."""
         t = self._bg_tasks.get(name)
         if t is not None and not t.done():
             return
-        self._bg_tasks[name] = asyncio.create_task(coro_fn(now))
+        self._bg_tasks[name] = asyncio.create_task(coro_fn(*args, **kwargs))
 
     def _journal(self, f: Fill) -> None:
         if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
@@ -649,8 +650,14 @@ class MarketMaker:
                 self._last_mkt_err = now
                 log.warning("market info refresh failed: %s", e)
 
-    def _on_reduce_only_rejected(self) -> None:
+    def _on_reduce_only_rejected(self, side: Optional[str] = None) -> None:
         log.warning("REDUCE_ONLY REJECTED: exchange has no position in this direction! Forcing position sync with exchange.")
+        if side == SELL and self.ledger.position > ZERO:
+            log.warning("Correcting local ledger long position %s -> 0 due to exchange REDUCE_ONLY rejection", fmt(self.ledger.position))
+            self.ledger.position = ZERO
+        elif side == BUY and self.ledger.position < ZERO:
+            log.warning("Correcting local ledger short position %s -> 0 due to exchange REDUCE_ONLY rejection", fmt(self.ledger.position))
+            self.ledger.position = ZERO
         self._spawn_bg("reconcile_force", self._reconcile_positions, self.now(), force=True)
 
     async def _reconcile_positions(self, now: float, force: bool = False) -> None:
@@ -675,11 +682,16 @@ class MarketMaker:
                     if int(r.get("marketId", -1)) == m.market_id:
                         found = True
                         side = str(r.get("side", "FLAT")).upper()
-                        sz = Decimal(str(r.get("size") or r.get("position") or "0"))
-                        signed_pos = sz if side in ("LONG", "BUY") else (-sz if side in ("SHORT", "SELL") else ZERO)
+                        raw_sz = Decimal(str(r.get("size") or r.get("position") or "0"))
+                        if side in ("LONG", "BUY"):
+                            signed_pos = abs(raw_sz)
+                        elif side in ("SHORT", "SELL"):
+                            signed_pos = -abs(raw_sz)
+                        else:
+                            signed_pos = raw_sz
                         old_pos = self.ledger.position
                         if self.ledger.reconcile(signed_pos, now, target_mid, m.min_notional, force=force):
-                            log.info("POSITION RECONCILED WITH EXCHANGE: %s %s (was %s)", side, fmt(sz), fmt(old_pos))
+                            log.info("POSITION RECONCILED WITH EXCHANGE: %s %s (was %s)", side, fmt(signed_pos), fmt(old_pos))
                         break
                 if not found:
                     old_pos = self.ledger.position

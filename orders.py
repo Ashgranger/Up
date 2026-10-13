@@ -13,7 +13,7 @@ from typing import Callable, Optional, Dict, Tuple, List
 from exchange import Exchange
 from market import Market
 from signer import Signer
-from utils import BUY, SELL, fmt, bps_diff, q_down, q_up
+from utils import BUY, SELL, fmt, bps_diff, q_down, q_up, ZERO
 
 log = logging.getLogger("orders")
 GTT_DAYS = 40
@@ -45,6 +45,7 @@ class OrderManager:
         self.cfg, self.ex, self.signer = cfg, ex, signer
         self.get_market = get_market
         self.on_fill = on_fill
+        self.ledger = None
         
         self.orders: dict[str, Order] = {}
         self._last_taker: dict = {}
@@ -297,13 +298,28 @@ class OrderManager:
             if existing:
                 await self.cancel(existing, now)
                 self.pair_slots.pop(slot, None)
+            taker_r_only = True
+            ledger = getattr(self, "ledger", None)
+            if ledger is not None:
+                if (t.side == SELL and ledger.position <= ZERO) or (t.side == BUY and ledger.position >= ZERO):
+                    taker_r_only = False
             await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                             time_in_force="IOC", reduce_only=True,
+                             time_in_force="IOC", reduce_only=taker_r_only,
                              quote_mid=getattr(t, "quote_mid", None),
                              est_px=getattr(t, "est_px", None))
             return
 
         is_exit = bool(getattr(t, "is_exit_quote", False))
+        # HARDWARE CLAMP: reduce_only is ONLY valid if we hold an opposing position!
+        # A SELL can ONLY reduce a LONG position (pos > 0).
+        # A BUY can ONLY reduce a SHORT position (pos < 0).
+        ledger = getattr(self, "ledger", None)
+        if ledger is not None:
+            if t.side == SELL and ledger.position <= ZERO:
+                is_exit = False
+            elif t.side == BUY and ledger.position >= ZERO:
+                is_exit = False
+
         if existing is None:
             if now >= self.reject_until[t.side]:
                 o_new = await self.place(t.pair_index, t.side, t.price, t.qty, now,
@@ -322,7 +338,7 @@ class OrderManager:
             await self.cancel(existing, now)
             self.pair_slots.pop(slot, None)
             await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                             time_in_force="ALO", reduce_only=True,
+                             time_in_force="ALO", reduce_only=is_exit,
                              quote_mid=getattr(t, "quote_mid", None))
             return
 
@@ -457,7 +473,12 @@ class OrderManager:
                             o.pair_index, o.side, reason)
                 if hasattr(self, "on_reduce_only_rejected") and callable(self.on_reduce_only_rejected):
                     try:
-                        self.on_reduce_only_rejected()
+                        self.on_reduce_only_rejected(o.side)
+                    except TypeError:
+                        try:
+                            self.on_reduce_only_rejected()
+                        except Exception:
+                            pass
                     except Exception:
                         pass
             elif (state == "REJECTED" or status == "REJECTED") and not o.is_taker:
