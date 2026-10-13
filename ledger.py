@@ -102,9 +102,12 @@ class OnlineLearner:
             "stress_loss_bps": Decimal(str(cfg.stress_loss_bps)),
             "max_hold_s": Decimal(str(cfg.max_hold_s)),
             "burst_fills": Decimal(str(cfg.burst_fills)),
+            "burst_window_s": Decimal(str(cfg.burst_window_s)),
             "burst_cooldown_s": Decimal(str(cfg.burst_cooldown_s)),
             "sweep_guard_fills": Decimal(str(cfg.sweep_guard_fills)),
             "sweep_guard_window_s": Decimal(str(cfg.sweep_guard_window_s)),
+            "trend_window_s": Decimal(str(cfg.trend_window_s)),
+            "trend_hold_s": Decimal(str(cfg.trend_hold_s)),
         }
 
         self._last_decay_ts: Optional[float] = None
@@ -132,10 +135,13 @@ class OnlineLearner:
             "exit_min_profit_bps": (Decimal("0.5"), Decimal("10.0")),
             "stress_loss_bps": (min(Decimal("10.0"), self.base["stress_loss_bps"]), max(Decimal("60.0"), self.base["stress_loss_bps"])),
             "max_hold_s": (min(Decimal("60.0"), self.base["max_hold_s"]), max(Decimal("1200.0"), self.base["max_hold_s"])),
-            "burst_fills": (Decimal("2"), Decimal("5")),
+            "burst_fills": (Decimal("1"), Decimal("5")),
+            "burst_window_s": (Decimal("10.0"), Decimal("60.0")),
             "burst_cooldown_s": (Decimal("10.0"), Decimal("90.0")),
-            "sweep_guard_fills": (Decimal("2"), Decimal("4")),
-            "sweep_guard_window_s": (Decimal("0.5"), Decimal("2.5")),
+            "sweep_guard_fills": (Decimal("1"), Decimal("4")),
+            "sweep_guard_window_s": (Decimal("0.5"), Decimal("4.0")),
+            "trend_window_s": (Decimal("5.0"), Decimal("30.0")),
+            "trend_hold_s": (Decimal("3.0"), Decimal("30.0")),
         }
 
         # Current live parameters initialized to base values
@@ -245,6 +251,18 @@ class OnlineLearner:
         return float(self.params["sweep_guard_window_s"]) if self.enabled else float(self.base["sweep_guard_window_s"])
 
     @property
+    def trend_window_s(self) -> float:
+        return float(self.params.get("trend_window_s", self.base.get("trend_window_s", 12.0))) if self.enabled else float(self.base.get("trend_window_s", 12.0))
+
+    @property
+    def trend_hold_s(self) -> float:
+        return float(self.params.get("trend_hold_s", self.base.get("trend_hold_s", 10.0))) if self.enabled else float(self.base.get("trend_hold_s", 10.0))
+
+    @property
+    def burst_window_s(self) -> float:
+        return float(self.params.get("burst_window_s", self.base.get("burst_window_s", 25.0))) if self.enabled else float(self.base.get("burst_window_s", 25.0))
+
+    @property
     def win_rate(self) -> float:
         total = self.n_benign + self.n_toxic
         return (float(self.n_benign) / float(total) * 100.0) if total > 0 else 0.0
@@ -277,6 +295,10 @@ class OnlineLearner:
             "burst_cooldown_s": "burst_cd",
             "sweep_guard_fills": "sweep_fills",
             "burst_fills": "burst_fills",
+            "sweep_guard_window_s": "sweep_win",
+            "burst_window_s": "burst_win",
+            "trend_window_s": "trend_win",
+            "trend_hold_s": "trend_hold",
         }
 
         diffs = []
@@ -378,8 +400,20 @@ class OnlineLearner:
             # 4. Increase exit profit expectation to recover adverse costs
             self.params["exit_min_profit_bps"] += Decimal("0.05") * severity
 
-            # 5. Tighten burst protection
+            # 5. Tighten burst & sweep protection in real-time
             self.params["burst_cooldown_s"] += Decimal("1.5") * severity
+            if "burst_window_s" in self.params:
+                self.params["burst_window_s"] += Decimal("1.0") * severity
+            if "sweep_guard_window_s" in self.params:
+                self.params["sweep_guard_window_s"] += Decimal("0.10") * severity
+
+            # 6. Real-time Flow Defense adaptation: tighten pull hurdle and extend trend hold
+            if "trend_pull_bps" in self.params:
+                self.params["trend_pull_bps"] -= Decimal("0.05") * severity
+            if "trend_hold_s" in self.params:
+                self.params["trend_hold_s"] += Decimal("0.50") * severity
+            if "trend_window_s" in self.params:
+                self.params["trend_window_s"] += Decimal("0.50") * severity
         else:
             # Profitable, benign markout
             self.n_benign += 1
@@ -397,12 +431,56 @@ class OnlineLearner:
             self.params["trend_widen"] -= (self.params["trend_widen"] - self.base["trend_widen"]) * decay
             self.params["obi_alpha"] -= (self.params["obi_alpha"] - self.base["obi_alpha"]) * decay
             self.params["tfi_beta"] -= (self.params["tfi_beta"] - self.base["tfi_beta"]) * decay
+            if "burst_cooldown_s" in self.params:
+                self.params["burst_cooldown_s"] -= (self.params["burst_cooldown_s"] - self.base["burst_cooldown_s"]) * decay
+            if "burst_window_s" in self.params:
+                self.params["burst_window_s"] -= (self.params["burst_window_s"] - self.base["burst_window_s"]) * decay
+            if "sweep_guard_window_s" in self.params:
+                self.params["sweep_guard_window_s"] -= (self.params["sweep_guard_window_s"] - self.base["sweep_guard_window_s"]) * decay
+            if "trend_pull_bps" in self.params:
+                self.params["trend_pull_bps"] += (self.base["trend_pull_bps"] - self.params["trend_pull_bps"]) * decay
+            if "trend_hold_s" in self.params:
+                self.params["trend_hold_s"] -= (self.params["trend_hold_s"] - self.base["trend_hold_s"]) * decay
+            if "trend_window_s" in self.params:
+                self.params["trend_window_s"] -= (self.params["trend_window_s"] - self.base["trend_window_s"]) * decay
 
         self._clamp_all()
         ctx = {f"markout_{h_str}": f"{float(m_bps):+.2f}bps"}
         self._log_param_diff(reason, old_params, ctx)
         self.save_soon()
 
+
+    def on_sweep(self, side: str, fill_count: int, window_s: float) -> None:
+        """Real-time feedback when a toxic multi-level sweep is detected in the order stream."""
+        if not self.enabled:
+            return
+        old_params = dict(self.params)
+        reason = "sweep_detected"
+        if "sweep_guard_window_s" in self.params:
+            self.params["sweep_guard_window_s"] += Decimal("0.15")
+        if "burst_cooldown_s" in self.params:
+            self.params["burst_cooldown_s"] += Decimal("2.0")
+        if "min_edge_bps" in self.params:
+            self.params["min_edge_bps"] += Decimal("0.15")
+        if "trend_pull_bps" in self.params:
+            self.params["trend_pull_bps"] -= Decimal("0.10")
+        self._clamp_all()
+        self._log_param_diff(reason, old_params, {"side": side, "fills": str(fill_count), "window": f"{window_s:.1f}s"})
+        self.save_soon()
+
+    def on_burst(self, side: str, fill_count: int, window_s: float) -> None:
+        """Real-time feedback when rapid successive fills hit the same side."""
+        if not self.enabled:
+            return
+        old_params = dict(self.params)
+        reason = "burst_detected"
+        if "burst_cooldown_s" in self.params:
+            self.params["burst_cooldown_s"] += Decimal("2.0")
+        if "burst_window_s" in self.params:
+            self.params["burst_window_s"] += Decimal("1.5")
+        self._clamp_all()
+        self._log_param_diff(reason, old_params, {"side": side, "fills": str(fill_count), "window": f"{window_s:.1f}s"})
+        self.save_soon()
 
     def predict_markout(self, side: str, regime: str, level: int = 0, horizon: float = 2.0) -> Decimal:
         """Empirical prediction of expected post-fill markout in basis points conditional on market state."""

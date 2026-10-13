@@ -576,7 +576,8 @@ class MarketMakingEngine:
             ledger.hold_s(now) > max_hold_time or
             (ledger.unrealized(mid) / abs(pos_usd) * BPS < -stress_loss_limit)
         ))
-        ret_5s = md.ret_bps(self.cfg.trend_window_s, now)
+        trend_win = l.trend_window_s if (l and hasattr(l, 'trend_window_s')) else self.cfg.trend_window_s
+        ret_5s = md.ret_bps(trend_win, now)
         trend_pull = l.trend_pull_bps if l else self.cfg.trend_pull_bps
         chase_cooldown = getattr(self.cfg, "chase_cooldown_s", 3.0)
 

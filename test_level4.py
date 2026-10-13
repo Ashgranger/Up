@@ -341,6 +341,38 @@ class TestLevel4MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(placed_orders[0][3], 'Hardware clamp MUST disarm reduce_only on SELL when position is short!')
         print('✓ test_08_reconcile_signed_short_position_and_hardware_clamp passed: Correct sign reconciliation and clamp verified.')
 
+    async def test_09_realtime_flow_defense_and_sweep_guard_adaptation(self):
+        """9. Real-Time Flow Defense & Sweep Guard Adaptation:
+        Verifies that Sweep Guard and Burst Guard events trigger immediate real-time feedback
+        to the Online Learner, expanding sweep windows, tightening trend pull hurdles,
+        and adapting burst cooldowns dynamically."""
+        bot, s, clock = sim.make(ENABLE_ONLINE_LEARNING=1)
+        l = bot.ledger.learner
+        base_sw = l.sweep_guard_window_s
+        base_bcd = l.burst_cooldown_s
+        base_bwin = l.burst_window_s
+        base_pull = l.trend_pull_bps
+        base_edge = l.min_edge_bps
+
+        # 1. Trigger sweep event
+        l.on_sweep('BUY', 2, 1.5)
+        self.assertGreater(l.sweep_guard_window_s, base_sw, 'Sweep window must expand on sweep detection')
+        self.assertGreater(l.burst_cooldown_s, base_bcd, 'Burst cooldown must increase on sweep detection')
+        self.assertGreater(l.min_edge_bps, base_edge, 'Min edge must widen on sweep detection')
+        self.assertLess(l.trend_pull_bps, base_pull, 'Trend pull must tighten on sweep detection')
+
+        # 2. Trigger burst event
+        l.on_burst('SELL', 2, 20.0)
+        self.assertGreater(l.burst_window_s, base_bwin, 'Burst window must expand on burst detection')
+
+        # 3. Trigger adverse markout
+        cur_sw = l.sweep_guard_window_s
+        cur_th = l.trend_hold_s
+        l.on_markout(D('-4.5'), 'BUY', D('2.0'), horizon=5.0)
+        self.assertGreater(l.sweep_guard_window_s, cur_sw, 'Sweep window must expand on adverse markout')
+        self.assertGreater(l.trend_hold_s, cur_th, 'Trend hold must increase on adverse markout')
+        print('✓ test_09_realtime_flow_defense_and_sweep_guard_adaptation passed: Real-time dynamic updates verified.')
+
 
 if __name__ == "__main__":
     unittest.main()

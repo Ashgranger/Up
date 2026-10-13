@@ -259,11 +259,12 @@ class MarketMaker:
         except Exception:
             self._fill_ctx = {"level": o.pair_index, "et": et_hhmmss(time.time())}
 
+        l = self.ledger.learner if (self.cfg.enable_online_learning and hasattr(self.ledger, 'learner')) else None
+        burst_win = l.burst_window_s if (l and hasattr(l, 'burst_window_s')) else self.cfg.burst_window_s
         self._recent_fills.append((now, side))
-        while self._recent_fills and now - self._recent_fills[0][0] > self.cfg.burst_window_s:
+        while self._recent_fills and now - self._recent_fills[0][0] > burst_win:
             self._recent_fills.popleft()
 
-        l = self.ledger.learner if (self.cfg.enable_online_learning and hasattr(self.ledger, 'learner')) else None
         burst_limit = l.burst_fills if l else self.cfg.burst_fills
         burst_cooldown = l.burst_cooldown_s if l else self.cfg.burst_cooldown_s
         sweep_limit = l.sweep_guard_fills if l else self.cfg.sweep_guard_fills
@@ -273,7 +274,9 @@ class MarketMaker:
         if same_side >= burst_limit:
             self._burst_blocked_until[side] = now + burst_cooldown
             log.warning("BURST GUARD: %d %s fills in %.1fs -> pulling %s for %.1fs",
-                        same_side, side, self.cfg.burst_window_s, side, burst_cooldown)
+                        same_side, side, burst_win, side, burst_cooldown)
+            if l and hasattr(l, 'on_burst'):
+                l.on_burst(side, same_side, burst_win)
             asyncio.create_task(self.om.cancel_side(side, now))
 
         rapid_fills = sum(1 for t, s in self._recent_fills if s == side and (now - t) <= sweep_window)
@@ -281,6 +284,8 @@ class MarketMaker:
             self._burst_blocked_until[side] = max(self._burst_blocked_until[side], now + burst_cooldown)
             log.warning("SWEEP GUARD: %d %s fills in <=%.1fs -> emergency cancel %s",
                         rapid_fills, side, sweep_window, side)
+            if l and hasattr(l, 'on_sweep'):
+                l.on_sweep(side, rapid_fills, sweep_window)
             asyncio.create_task(self.om.cancel_side(side, now))
 
         self._journal(fill)
@@ -473,13 +478,15 @@ class MarketMaker:
 
             l = self.ledger.learner if (self.cfg.enable_online_learning and hasattr(self.ledger, 'learner')) else None
             trend_pull = l.trend_pull_bps if l else self.cfg.trend_pull_bps
+            trend_win = l.trend_window_s if (l and hasattr(l, 'trend_window_s')) else self.cfg.trend_window_s
+            trend_hold = l.trend_hold_s if (l and hasattr(l, 'trend_hold_s')) else self.cfg.trend_hold_s
 
-            ret_trend = self.md.ret_bps(self.cfg.trend_window_s, now)
+            ret_trend = self.md.ret_bps(trend_win, now)
             if ret_trend <= -trend_pull:
-                self._trend_blocked_until[BUY] = now + self.cfg.trend_hold_s
+                self._trend_blocked_until[BUY] = now + trend_hold
                 buy_blocked = True
             elif ret_trend >= trend_pull:
-                self._trend_blocked_until[SELL] = now + self.cfg.trend_hold_s
+                self._trend_blocked_until[SELL] = now + trend_hold
                 sell_blocked = True
 
             if self.cfg.enable_cross_exchange and self.md.cross.venues:
