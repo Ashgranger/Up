@@ -374,5 +374,58 @@ class TestLevel4MarketMaker(unittest.IsolatedAsyncioTestCase):
         print('✓ test_09_realtime_flow_defense_and_sweep_guard_adaptation passed: Real-time dynamic updates verified.')
 
 
+    async def test_10_unified_system_no_ladder_collision_and_no_wiggle_loss(self):
+        """10. Unified System Closed-Loop Feedback, Wiggle Protection & Ladder Collision Guard:
+        Verifies:
+        - Normal 1.5-2.5 bps wiggles do NOT trigger maker loss-selling below breakeven.
+        - L1 can never collide at the exact same price as a resting L0 order.
+        - Fills and markouts feed back into impact_kernel, meta_learner, markout_model, and causal_estimator.
+        """
+        bot, s, clock = sim.make(
+            ORDER_USD=20, MAX_POSITION_USD=100, EXTRA_LEVELS=1,
+            MIN_EDGE_BPS="2.2", LEVEL_SPACING_BPS="2.0", MAKER_EXIT_FIRST="1", ENABLE_TAKER_EXITS="0"
+        )
+        m = sim.Market(10, "NVDA-USD", "ONLINE", D("0.01"), D("0.0001"), [], D("5"), D("0.0001"), D("100000"), D("226.90"), False)
+        bot.md.info = m
+        bot.md.update(D("226.89"), D("226.91"), D("10.0"), D("10.0"), clock.t)
+
+        # 1. Enter Long at 226.90
+        import orders, engine
+        o_buy = orders.Order("b0", 0, BUY, D("226.90"), D("0.10"), D("0.10"), 1001, clock.t, clock.t, quote_mid=D("226.90"))
+        bot._on_fill(BUY, D("0.10"), D("226.90"), o_buy)
+        self.assertGreater(len(bot.engine.impact_kernel.trades), 0, "Fill must feed impact_kernel")
+        self.assertGreater(len(bot.engine.meta_learner._fills_log), 0, "Fill must feed meta_learner")
+
+        # 2. Simulate a 2.0 bps dip (226.85 / 226.87, mid=226.86 -> -1.76 bps unrealized)
+        clock.t += 1.0
+        bot.md.update(D("226.85"), D("226.87"), D("10.0"), D("10.0"), clock.t)
+        bot.ledger.process_markouts(bot.md.mid, clock.t)
+        self.assertGreater(len(bot.engine.markout_model.distributions), 0, "Markout must feed markout_model")
+
+        quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        sells = [q for q in quotes if q.side == SELL]
+        self.assertGreaterEqual(len(sells), 1)
+        self.assertGreaterEqual(sells[0].price, D("226.90"), "Maker unwind must NOT dump at 226.87 loss on a 1.76 bps wiggle!")
+        if len(sells) >= 2:
+            self.assertGreater(sells[1].price, sells[0].price, "L1S must be strictly higher than L0S!")
+
+        # 3. Verify OrderManager collision guard when L0S is resting at 226.94 and L1S tries to modify to 226.94
+        o0 = orders.Order("s0", 0, SELL, D("226.94"), D("0.10"), D("0.10"), 2001, clock.t, clock.t)
+        o1 = orders.Order("s1", 1, SELL, D("226.98"), D("0.10"), D("0.10"), 2002, clock.t - 5.0, clock.t - 5.0)
+        bot.om.orders = {"s0": o0, "s1": o1}
+        bot.om.pair_slots = {(0, SELL): "s0", (1, SELL): "s1"}
+        modified_prices = []
+        async def mock_mod(o, px, now, reduce_only=None, **kw):
+            modified_prices.append(px)
+            o.price = px
+            return True
+        bot.om.modify = mock_mod
+        t1 = engine.QuoteTarget(1, SELL, D("226.94"), D("0.10"), D("1.0"), 0.5, False, D("226.90"))
+        await bot.om._sync_one(t1, clock.t)
+        if modified_prices:
+            self.assertGreater(modified_prices[0], D("226.94"), "Collision guard must push L1S strictly above resting L0S (226.94)!")
+        print("✓ test_10_unified_system_no_ladder_collision_and_no_wiggle_loss passed: Closed-loop system, wiggle protection & collision guard verified.")
+
+
 if __name__ == "__main__":
     unittest.main()

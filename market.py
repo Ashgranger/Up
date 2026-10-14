@@ -374,6 +374,9 @@ class MarketData:
         self._trades: deque = deque()
         self._tfi_cache: dict = {}
         self._tfi_now = None
+        self._ret_cache: dict = {}
+        self._move_cache: dict = {}
+        self._cons_cache: dict = {}
         self._vol_ewma = ZERO
         self._book_depth_bids: list = []
         self._book_depth_asks: list = []
@@ -386,11 +389,14 @@ class MarketData:
         self.latent_estimator = LatentStateEstimator(cfg)
         self.belief_state: BeliefState = self.latent_estimator.belief
         self.latent_state: LatentState = self.latent_estimator.state
+        self._excl_cfg: bool = bool(getattr(cfg, "exclude_own_orders", False))
+        self._mid_cache_pair = (None, None)
+        self._mid_cache_val: Optional[Decimal] = None
 
     # ---------------- own-order exclusion ----------------
     @property
     def _excl(self) -> bool:
-        return bool(getattr(self.cfg, "exclude_own_orders", False)) and self.own_provider is not None
+        return self._excl_cfg and self.own_provider is not None
 
     def _own_at(self, side: str, price: Decimal) -> Decimal:
         if not self._excl:
@@ -465,6 +471,8 @@ class MarketData:
                ask_sz: Optional[Decimal], now: float) -> None:
         prev = self.mid
         self.bid, self.ask, self.bid_sz, self.ask_sz, self.ts = bid, ask, bid_sz, ask_sz, now
+        self._ret_cache.clear()
+        self._move_cache.clear()
         mid = self.mid
         if prev and mid and bid < ask:
             if abs(mid - prev) / prev * BPS >= self.cfg.jump_bps:
@@ -506,17 +514,18 @@ class MarketData:
     def on_trade(self, side: str, size: Decimal, price: Decimal, now: float) -> None:
         self._trades.append((now, side.upper(), size, price))
         self._tfi_cache.clear()
+        self._cons_cache.clear()
         self._tfi_now = None
         while self._trades and now - self._trades[0][0] > 60.0:
             self._trades.popleft()
 
     def on_depth(self, bids: list, asks: list, now: float) -> None:
         try:
-            self._book_depth_bids = [(_D(r[0]), _D(r[1])) for r in bids]
-            self._book_depth_asks = [(_D(r[0]), _D(r[1])) for r in asks]
+            self._book_depth_bids = [(_D(r[0]), _D(r[1])) for r in bids[:20]]
+            self._book_depth_asks = [(_D(r[0]), _D(r[1])) for r in asks[:20]]
         except Exception:
-            self._book_depth_bids = bids
-            self._book_depth_asks = asks
+            self._book_depth_bids = bids[:20]
+            self._book_depth_asks = asks[:20]
 
     def update_cross_venue(self, venue: str, bid: Decimal, ask: Decimal,
                            bid_sz: Decimal, ask_sz: Decimal, now: float) -> None:
@@ -535,7 +544,16 @@ class MarketData:
 
     @property
     def mid(self) -> Optional[Decimal]:
-        return (self.bid + self.ask) / 2 if self.bid is not None and self.ask is not None else None
+        b, a = self.bid, self.ask
+        if b is None or a is None:
+            return None
+        pair = (b, a)
+        if self._mid_cache_pair == pair:
+            return self._mid_cache_val
+        val = (b + a) * Decimal("0.5")
+        self._mid_cache_pair = pair
+        self._mid_cache_val = val
+        return val
 
     @property
     def micro(self) -> Optional[Decimal]:
@@ -590,6 +608,10 @@ class MarketData:
         return [m for t, m in self._hist if now - t <= window_s]
 
     def ret_bps(self, window_s: float, now: float) -> Decimal:
+        key = (window_s, now, len(self._hist), self._hist[-1][1] if self._hist else None)
+        hit = self._ret_cache.get(key)
+        if hit is not None:
+            return hit
         newest = oldest = None
         n = 0
         for t, m in reversed(self._hist):
@@ -599,11 +621,15 @@ class MarketData:
                 newest = m
             oldest = m
             n += 1
-        if n < 2 or oldest == 0:
-            return ZERO
-        return (newest - oldest) / oldest * BPS
+        res = ZERO if (n < 2 or not oldest) else (newest - oldest) / oldest * BPS
+        self._ret_cache[key] = res
+        return res
 
     def move_bps(self, window_s: float, now: float) -> Decimal:
+        key = (window_s, now, len(self._hist), self._hist[-1][1] if self._hist else None)
+        hit = self._move_cache.get(key)
+        if hit is not None:
+            return hit
         newest = oldest = hi = lo = None
         n = 0
         for t, m in reversed(self._hist):
@@ -618,11 +644,9 @@ class MarketData:
                     lo = m
             oldest = m
             n += 1
-        if n < 2:
-            return ZERO
-        if oldest == 0:
-            return ZERO
-        return (hi - lo) / newest * BPS
+        res = ZERO if (n < 2 or not oldest) else (hi - lo) / newest * BPS
+        self._move_cache[key] = res
+        return res
 
     @property
     def vol_bps(self) -> Decimal:
@@ -643,37 +667,46 @@ class MarketData:
         """Calculates resting queue depth ahead of (and at) our quote price on the given side."""
         if side in ("BUY", "BID"):
             if not self._book_depth_bids:
-                return self.top_size("BUY") or Decimal("1")
+                return self.top_size("BUY") or ONE
             ahead = ZERO
-            for row in self.depth_levels("BUY"):
-                p, sz = _D(row[0]), _D(row[1])
-                if p >= price:
-                    ahead += sz
+            for p, sz in self.depth_levels("BUY"):
+                p_d = p if isinstance(p, Decimal) else _D(p)
+                if p_d >= price:
+                    ahead += (sz if isinstance(sz, Decimal) else _D(sz))
                 else:
                     break
-            return ahead if ahead > ZERO else (self.top_size("BUY") or Decimal("1"))
+            return ahead if ahead > ZERO else (self.top_size("BUY") or ONE)
         else:
             if not self._book_depth_asks:
-                return self.top_size("SELL") or Decimal("1")
+                return self.top_size("SELL") or ONE
             ahead = ZERO
-            for row in self.depth_levels("SELL"):
-                p, sz = _D(row[0]), _D(row[1])
-                if p <= price:
-                    ahead += sz
+            for p, sz in self.depth_levels("SELL"):
+                p_d = p if isinstance(p, Decimal) else _D(p)
+                if p_d <= price:
+                    ahead += (sz if isinstance(sz, Decimal) else _D(sz))
                 else:
                     break
-            return ahead if ahead > ZERO else (self.top_size("SELL") or Decimal("1"))
+            return ahead if ahead > ZERO else (self.top_size("SELL") or ONE)
 
     def consumption_rate(self, side: str, window_s: float, now: float) -> Decimal:
         """Aggressive trade volume hitting the given book side per second."""
+        is_bid = side in ("BUY", "BID")
+        key = (is_bid, window_s, now)
+        hit = self._cons_cache.get(key)
+        if hit is not None:
+            return hit
+        if len(self._cons_cache) > 32:
+            self._cons_cache.clear()
         vol = ZERO
-        target_trade_side = "SELL" if side in ("BUY", "BID") else "BUY"
+        target_trade_side = "SELL" if is_bid else "BUY"
         for t, s, sz, _ in reversed(self._trades):
             if now - t > window_s:
                 break
             if s == target_trade_side:
                 vol += sz
-        return vol / Decimal(str(max(0.1, window_s)))
+        res = vol / Decimal(str(max(0.1, window_s)))
+        self._cons_cache[key] = res
+        return res
 
     def liquidity_fragility(self, side: str, now: float) -> Decimal:
         """Ratio of aggressive counter-flow volume (1s) to available resting depth (L1-L5).

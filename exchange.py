@@ -38,6 +38,7 @@ class Exchange:
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future] = {}
         self._dry_seq = itertools.count(1)
+        self.rtt_ms: float = 10.0
 
     @property
     def is_connected(self) -> bool:
@@ -68,13 +69,18 @@ class Exchange:
         if not self.is_connected and not self.cfg.dry_run:
             return {"status": 503, "error": {"type": "NOT_CONNECTED", "message": "WebSocket not connected"}}
         rid = next(self._ids)
-        fut = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
         self._pending[rid] = fut
+        t0 = loop.time()
         try:
             sent = await self._send({"type": kind, "id": rid, "request": request})
             if not sent and not self.cfg.dry_run:
                 return {"status": 503, "error": {"type": "CONNECTION_CLOSED", "message": "Failed to send over WebSocket"}}
-            return await asyncio.wait_for(fut, timeout)
+            resp = await asyncio.wait_for(fut, timeout)
+            dt_ms = max(0.5, (loop.time() - t0) * 1000.0)
+            self.rtt_ms = 0.80 * self.rtt_ms + 0.20 * dt_ms
+            return resp
         except asyncio.TimeoutError:
             return {"status": 408, "error": {"type": "TIMEOUT", "message": f"Request {kind} timed out after {timeout}s"}}
         except Exception as e:

@@ -46,6 +46,7 @@ class OrderManager:
         self.get_market = get_market
         self.on_fill = on_fill
         self.ledger = None
+        self.md = None
         
         self.orders: dict[str, Order] = {}
         self._last_taker: dict = {}
@@ -135,6 +136,12 @@ class OrderManager:
             px = q_up(px, tick) if side == BUY else q_down(px, tick)
         else:
             px = q_down(px, tick) if side == BUY else q_up(px, tick)
+            md = getattr(self, "md", None)
+            if md is not None and md.bid and md.ask and md.bid < md.ask:
+                if side == BUY and px >= md.ask:
+                    px = q_down(md.ask - tick, tick)
+                elif side == SELL and px <= md.bid:
+                    px = q_up(md.bid + tick, tick)
         qty = q_down(qty, m.step)
         if qty < m.min_size or (m.min_notional > 0 and px * qty < m.min_notional):
             return None
@@ -152,6 +159,7 @@ class OrderManager:
                 self._backoff(side, now)
             return None
         self._consec_errors = 0
+        self._reject_n[side] = 0
         self.n_place += 1
         oid = str(res["orderId"])
         o = Order(oid, pair_index, side, px, qty, qty, good_til, now, now,
@@ -174,7 +182,15 @@ class OrderManager:
         m = self.get_market()
         tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
         px = q_down(px, tick) if o.side == BUY else q_up(px, tick)
+        md = getattr(self, "md", None)
+        if md is not None and md.bid and md.ask and md.bid < md.ask:
+            if o.side == BUY and px >= md.ask:
+                px = q_down(md.ask - tick, tick)
+            elif o.side == SELL and px <= md.bid:
+                px = q_up(md.bid + tick, tick)
         r_only = o.is_reduce_only if reduce_only is None else reduce_only
+        if px == o.price and r_only == o.is_reduce_only:
+            return True
         req = self.signer.modify(m, o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
         resp = await self.ex.write(req)
         if not self._ok(resp):
@@ -267,18 +283,20 @@ class OrderManager:
 
     async def sync_quotes(self, targets: list, now: float, blocked_sides: Optional[set] = None) -> None:
         active_slots = set()
-        groups: dict = {}
+        side_groups: dict = {}
         for t in targets:
             slot = (t.pair_index, t.side)
-            groups.setdefault(slot, []).append(t)
+            side_groups.setdefault(t.side, []).append(t)
             if not getattr(t, "is_taker", False):
                 active_slots.add(slot)
 
-        async def run_group(ts: list) -> None:
-            for t in ts:  # same-slot targets stay strictly sequential
+        async def run_side(ts: list) -> None:
+            # Process L0 -> L1 -> L2 -> L3 in strict order per side so deeper levels never collide with resting closer levels
+            ts_sorted = sorted(ts, key=lambda x: (0 if getattr(x, "is_taker", False) else 1, x.pair_index))
+            for t in ts_sorted:
                 await self._sync_one(t, now)
 
-        coros = [run_group(ts) for ts in groups.values()]
+        coros = [run_side(ts) for ts in side_groups.values()]
         for slot, oid in list(self.pair_slots.items()):
             if slot not in active_slots:
                 o = self.orders.get(oid)
@@ -309,6 +327,19 @@ class OrderManager:
                              est_px=getattr(t, "est_px", None))
             return
 
+        m = self.get_market()
+        tick = m.tick_for(t.price) if hasattr(m, "tick_for") else m.tick
+        target_px = t.price
+        # LADDER COLLISION GUARD: Ensure level k > 0 is strictly deeper than all resting levels < k on the same side
+        if t.pair_index > 0:
+            for o in self.orders.values():
+                if o.side == t.side and not o.is_taker and o.cancelling_since is None and o.pair_index < t.pair_index:
+                    if t.side == BUY and target_px >= o.price:
+                        target_px = q_down(o.price - tick, tick)
+                    elif t.side == SELL and target_px <= o.price:
+                        target_px = q_up(o.price + tick, tick)
+            t.price = target_px
+
         is_exit = bool(getattr(t, "is_exit_quote", False))
         # HARDWARE CLAMP: reduce_only is ONLY valid if we hold an opposing position!
         # A SELL can ONLY reduce a LONG position (pos > 0).
@@ -328,9 +359,6 @@ class OrderManager:
                 if o_new:
                     o_new.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
             return
-
-        m = self.get_market()
-        is_exit = bool(getattr(t, "is_exit_quote", False))
 
         # Check if unwind quantity mismatch (accumulated further fills: must resize!)
         qty_mismatch = abs(t.qty - existing.remaining) >= (m.step * Decimal("0.5"))
@@ -483,7 +511,10 @@ class OrderManager:
                         pass
             elif (state == "REJECTED" or status == "REJECTED") and not o.is_taker:
                 self.n_reject += 1
-                self._backoff(o.side, now)
+                if "POST_ONLY" in str(reason).upper() or "WOULD_CROSS" in str(reason).upper():
+                    self.reject_until[o.side] = max(self.reject_until[o.side], now + 0.15)
+                else:
+                    self._backoff(o.side, now)
             log.info("ORDER L%d %s %s %s", o.pair_index, o.side, state or status, reason)
             self._remove_order(o.order_id)
 

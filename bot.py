@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import time
 from collections import deque
@@ -92,6 +93,7 @@ class MarketMaker:
         self.engine = MarketMakingEngine(cfg)
         self.om = OrderManager(cfg, self.ex, self.signer, self._get_market, self._on_fill)
         self.om.ledger = self.ledger
+        self.om.md = self.md
         self.om.on_reduce_only_rejected = self._on_reduce_only_rejected
 
         self._recent_fills: deque = deque()
@@ -219,9 +221,12 @@ class MarketMaker:
 
     def on_external_liq(self, venue: str, side: str, size: Decimal, price: Decimal) -> None:
         self.md.update_cross_liq(venue, side, size, price, self.now())
-        log.warning("LIQUIDATION %s forced-%s %s @ %s (~$%s)", venue, side, size, price,
-                    f"{float(size * price):,.0f}")
-        self._dirty_evt.set()
+        notional = float(size * price)
+        if notional >= 5000.0:
+            log.warning("LIQUIDATION %s forced-%s %s @ %s (~$%s)", venue, side, size, price, f"{notional:,.0f}")
+            self._dirty_evt.set()
+        else:
+            self._wake_throttled()
 
     def on_external_disconnect(self, venue: str) -> None:
         self.md.cross.drop_venue(venue)
@@ -242,10 +247,19 @@ class MarketMaker:
         m = self.md.info
         mid = getattr(o, "quote_mid", None) or self.md.mid or price
         min_notional = m.min_notional if m else Decimal("5")
-        
+
         is_maker = not getattr(o, "is_taker", False)
         fill = self.ledger.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
         current_mid = self.md.mid or price
+
+        # Closed-loop Level 2/3/4 feedback on fill
+        notional_usd = float(qty * price)
+        try:
+            self.engine.impact_kernel.record_fill(side, notional_usd, now)
+            self.engine.meta_learner.record_fill(side, float(price), notional_usd, False, now)
+        except Exception:
+            pass
+
         log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s ET=%s",
                  o.pair_index, side, fmt(qty), fmt(price), fmt(fill.edge_bps),
                  fmt(self.ledger.position), fmt(self.ledger.total_pnl(current_mid)),
@@ -336,13 +350,38 @@ class MarketMaker:
                 if not o.is_taker and o.cancelling_since is None and o.remaining > 0 and (now - o.created) >= age]
 
     def _journal_markout(self, f: Fill, horizon: float, m_bps) -> None:
-        """Per-fill markout rows (join to fills on fill_ts) for offline conditional-EV fitting."""
+        """Per-fill markout rows (join to fills on fill_ts) for offline conditional-EV fitting
+        and live closed-loop updates to Level 2/3/4 engines."""
+        m_val = float(m_bps)
+        try:
+            belief = self.md.belief_state
+            dom = belief.dominant_regime
+            regime_str = dom.value if hasattr(dom, "value") else str(dom)
+            self.engine.markout_model.record_realization(f.side, regime_str, horizon, m_val)
+            if abs(horizon - 1.0) < 0.25 or abs(horizon - 2.0) < 0.25:
+                pred_m, _ = self.engine.markout_model.predict_markout(f.side, belief, horizon)
+                self.engine.meta_learner.record_markout_prediction(float(pred_m), m_val)
+                if m_val < -0.5 and self.engine.meta_learner._fills_log:
+                    last_rec = self.engine.meta_learner._fills_log[-1]
+                    self.engine.meta_learner._fills_log[-1] = (
+                        last_rec[0], last_rec[1], last_rec[2], last_rec[3], True
+                    )
+                signed_sz = float(f.qty * f.price) * (1.0 if f.side == BUY else -1.0)
+                exog = float(self.md.obi) * 0.5 + float(self.md.trade_flow_imbalance(5.0, self.now())) * 0.5
+                self.engine.causal_estimator.record_outcome(
+                    signed_order_usd=signed_sz,
+                    observed_price_change_bps=-m_val if f.side == BUY else m_val,
+                    exogenous_signal_bps=exog,
+                )
+        except Exception:
+            pass
+
         if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
             return
         try:
             self._fp(self.cfg.journal_path).write(json.dumps({
                 "type": "markout", "fill_ts": f.ts, "side": f.side,
-                "h": horizon, "markout_bps": round(float(m_bps), 4)}) + "\n")
+                "h": horizon, "markout_bps": round(m_val, 4)}) + "\n")
         except Exception:
             pass
 
@@ -391,6 +430,10 @@ class MarketMaker:
             now = self.now()
             self.ledger.last_now = now
             self.ledger.current_now = now
+            # Synchronize live exchange WebSocket RTT and queue depth into engine latency state
+            self.engine.latency_state.ws_rtt_ms = getattr(self.ex, "rtt_ms", 10.0)
+            self.engine.latency_state.order_ack_ms = getattr(self.ex, "rtt_ms", 15.0)
+            self.engine.latency_state.queue_backlog = len(getattr(self.ex, "_pending", ()))
             if hasattr(self.ledger, "learner") and (now - getattr(self, "_last_decay_call", 0.0) >= 1.0):
                 self._last_decay_call = now
                 self.ledger.learner.tick_decay(now)
@@ -631,7 +674,10 @@ class MarketMaker:
         QUOTE_OUTSIDE_RTH pause ran on a frozen snapshot. Refresh the volatile fields in place (tick/step untouched)."""
         if self.cfg.market_refresh_s <= 0 or not self.md.info:
             return
-        if now - getattr(self, "_last_mkt_refresh", -1e9) < self.cfg.market_refresh_s:
+        eff_refresh = max(5.0, float(self.cfg.market_refresh_s))
+        if now < getattr(self, "_mkt_refresh_backoff_until", 0.0):
+            return
+        if now - getattr(self, "_last_mkt_refresh", -1e9) < eff_refresh:
             return
         self._last_mkt_refresh = now
         try:
@@ -653,6 +699,8 @@ class MarketMaker:
             self._last_rth_flag = fresh.is_outside_rth
             self.md.info_ts = now
         except Exception as e:
+            if "429" in str(e):
+                self._mkt_refresh_backoff_until = now + 15.0
             if now - getattr(self, "_last_mkt_err", -1e9) > 60.0:
                 self._last_mkt_err = now
                 log.warning("market info refresh failed: %s", e)
@@ -816,15 +864,25 @@ class MarketMaker:
                     close_timeout=5,
                     compression=None
                 ) as ws:
+                    # Enable TCP_NODELAY for minimal wire latency
+                    try:
+                        sock = ws.transport.get_extra_info("socket") if getattr(ws, "transport", None) else None
+                        if sock is not None:
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except Exception:
+                        pass
+
                     self.ex.ws = ws
                     reader_task = asyncio.create_task(self.ex.reader())
 
-                    await self.ex.subscribe("bbo", self.cfg.market)
-                    await self.ex.subscribe("l2Orderbook", self.cfg.market)
-                    await self.ex.subscribe("trades", self.cfg.market)
-                    await self.ex.subscribe("orders", self.cfg.address)
-                    await self.ex.subscribe("userFills", self.cfg.address)
-                    await self.ex.subscribe("positions", self.cfg.address)
+                    await asyncio.gather(
+                        self.ex.subscribe("bbo", self.cfg.market),
+                        self.ex.subscribe("l2Orderbook", self.cfg.market),
+                        self.ex.subscribe("trades", self.cfg.market),
+                        self.ex.subscribe("orders", self.cfg.address),
+                        self.ex.subscribe("userFills", self.cfg.address),
+                        return_exceptions=True,
+                    )
 
                     reconnect_delay = 1.0
                     self._last_heartbeat = 0.0
@@ -842,13 +900,14 @@ class MarketMaker:
                         self._spawn_bg("mktinfo", self._refresh_market_info, now)
                         self._status_log(now)
 
+                        self._dirty_evt.clear()
                         await self.tick()
 
-                        try:
-                            await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
-                            self._dirty_evt.clear()
-                        except asyncio.TimeoutError:
-                            pass
+                        if not self._dirty_evt.is_set():
+                            try:
+                                await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
+                            except asyncio.TimeoutError:
+                                pass
 
                     if self.stop_evt.is_set():
                         await self._graceful_cancel()  # must happen while the socket is still open
@@ -887,3 +946,42 @@ class MarketMaker:
             except Exception:
                 pass
         self._close_files()
+
+
+def setup_logging(level_str: str) -> None:
+    lvl = getattr(logging, level_str.upper(), logging.INFO)
+    logging.basicConfig(
+        level=lvl,
+        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+
+
+async def main() -> None:
+    cfg = Config.from_env()
+    setup_logging(cfg.log_level)
+
+    errors = cfg.validate()
+    if errors:
+        for err in errors:
+            log.error("Config error: %s", err)
+        sys.exit(1)
+
+    bot = MarketMaker(cfg)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, bot.stop_evt.set)
+        except NotImplementedError:
+            pass
+
+    await bot.run()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

@@ -48,6 +48,7 @@ class VenueFeed:
         self.url = url
         self._connect = connect
         self.msgs = 0
+        self._empty_connects = 0
         self.connected = False
         self._stop = False
         self.disabled = False      # set when the venue permanently rejects our symbol
@@ -89,6 +90,11 @@ class VenueFeed:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=self.idle_timeout_s)
                         except asyncio.TimeoutError:
+                            if self.msgs == 0:
+                                self._empty_connects += 1
+                                if self._empty_connects >= 2:
+                                    self.disabled = True
+                                    break
                             log.warning("[%s] no data for %.0fs - reconnecting", self.name, self.idle_timeout_s)
                             break
                         try:
@@ -96,6 +102,7 @@ class VenueFeed:
                         except Exception as e:  # never let a bad packet kill the feed
                             log.debug("[%s] bad message: %r", self.name, e)
                         self.msgs += 1
+                        self._empty_connects = 0
                         delay = 1.0
             except asyncio.CancelledError:
                 raise
