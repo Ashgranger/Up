@@ -278,3 +278,9 @@ class QueueAwareSimulator:
 
     def total_pnl_usd(self, current_mid: Decimal) -> Decimal:
         return self.realized_pnl_usd + self.unrealized_pnl_usd(current_mid)
+
+
+if __name__ == "__main__":
+    import asyncio
+    from sim import run_standalone_sim
+    asyncio.run(run_standalone_sim(steps=300))

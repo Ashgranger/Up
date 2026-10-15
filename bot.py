@@ -138,6 +138,8 @@ class MarketMaker:
                 bid_sz = Decimal(str(bb["size"])) if "size" in bb else None
                 ask_sz = Decimal(str(ba["size"])) if "size" in ba else None
                 self.md.update(bid, ask, bid_sz, ask_sz, now)
+                if self.cfg.dry_run:
+                    self.om.on_dry_bbo(bid, ask, now)
                 if self.md.mid:
                     self.ledger.process_markouts(self.md.mid, now)
                 self._dirty_evt.set()
@@ -178,6 +180,8 @@ class MarketMaker:
             self._dirty_evt.set()
 
         elif channel == "positions":
+            if self.cfg.dry_run:
+                return
             rows = extract_positions(contents)
             m = self.md.info
             if m:
@@ -239,6 +243,10 @@ class MarketMaker:
             px = Decimal(str(tr.get("price") or "0"))
             if sz > 0:
                 self.md.on_trade(side, sz, px, now)
+                if self.cfg.dry_run:
+                    self.om.on_dry_trade(side, sz, px, now)
+                    if self.md.mid:
+                        self.ledger.process_markouts(self.md.mid, now)
         except Exception:
             pass
 
@@ -716,6 +724,8 @@ class MarketMaker:
         self._spawn_bg("reconcile_force", self._reconcile_positions, self.now(), force=True)
 
     async def _reconcile_positions(self, now: float, force: bool = False) -> None:
+        if self.cfg.dry_run:
+            return
         m = self.md.info
         if not m:
             return
@@ -757,6 +767,8 @@ class MarketMaker:
             log.debug("position reconciliation error: %s", e)
 
     async def _reconcile(self, now: float) -> None:
+        if self.cfg.dry_run:
+            return
         if now - self._last_reconcile < self.cfg.reconcile_s:
             return
         self._last_reconcile = now

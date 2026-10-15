@@ -21,7 +21,7 @@ log = logging.getLogger("main")
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Arcus perp market maker (Level 7 Engine)")
-    ap.add_argument("cmd", nargs="?", default="run", choices=["run", "scan"])
+    ap.add_argument("cmd", nargs="?", default="run", choices=["run", "scan", "sim"])
     ap.add_argument("--live", action="store_true", help="send real orders (overrides DRY_RUN=1)")
     ap.add_argument("--env", choices=["mainnet", "testnet"], help="override ARCUS_ENV")
     ap.add_argument("--market", help="override MARKET")
@@ -51,6 +51,10 @@ def main() -> None:
     if args.cmd == "scan":
         from scan import scan
         asyncio.run(scan(cfg, args.seconds))
+        return
+    if args.cmd == "sim":
+        from sim import run_standalone_sim
+        asyncio.run(run_standalone_sim(steps=max(60, int(args.seconds * 10)), market_name=cfg.market))
         return
 
     from bot import MarketMaker

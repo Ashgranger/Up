@@ -427,5 +427,88 @@ class TestLevel4MarketMaker(unittest.IsolatedAsyncioTestCase):
         print("✓ test_10_unified_system_no_ladder_collision_and_no_wiggle_loss passed: Closed-loop system, wiggle protection & collision guard verified.")
 
 
+    async def test_11_nbis_log_regression_strict_edge_and_no_wick_stop(self):
+        """11. NBIS-USD Log Regression (Strict Edge Floor, Wick-Stop Protection & Persistent Toxicity Floor):
+        Verifies:
+        - When MIN_EDGE_BPS=3.2 and ENABLE_SELECTIVE_TOUCH=1, L0 never quotes inside model_px (<3.2 bps from mid).
+        - A transient -11.0 bps wick at hold=3.0s (with STRESS_LOSS_BPS=15.0) does NOT trigger stress_loss stop-out.
+        - After >=10 markouts with >55% adverse fill rate, tick_decay preserves an elevated toxicity floor above base.
+        """
+        import orders, engine
+        bot, s, clock = sim.make(
+            ORDER_USD=35, MAX_POSITION_USD=105, EXTRA_LEVELS=1,
+            MIN_EDGE_BPS="3.2", LEVEL_SPACING_BPS="3.5", STRESS_LOSS_BPS="15.0",
+            EMERGENCY_TAKER_LOSS_BPS="18.0", ENABLE_SELECTIVE_TOUCH="1",
+            MAKER_EXIT_FIRST="1", ENABLE_TAKER_EXITS="0"
+        )
+        m = sim.Market(46, "NBIS-USD", "ONLINE", D("0.01"), D("0.0000001"), [], D("5"), D("0.0000001"), D("100000"), D("186.50"), False)
+        bot.md.info = m
+        bot.md.update(D("186.49"), D("186.51"), D("10.0"), D("10.0"), clock.t)
+
+        # 1. Flat quoting: L0 bid must respect MIN_EDGE_BPS=3.2 (<= 186.44, never at touch 186.49!)
+        quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        bids = [q for q in quotes if q.side == BUY]
+        self.assertGreaterEqual(len(bids), 1)
+        self.assertLessEqual(bids[0].price, D("186.44"), f"L0 bid {bids[0].price} must respect MIN_EDGE_BPS=3.2 (<=186.44)")
+
+        # 2. Enter Long at 186.44, then experience a 3.0s wick down to 186.23 (-11.26 bps unrealized)
+        o_buy = orders.Order("b0", 0, BUY, D("186.44"), D("0.18"), D("0.18"), 1001, clock.t, clock.t, quote_mid=D("186.50"))
+        bot._on_fill(BUY, D("0.18"), D("186.44"), o_buy)
+        clock.t += 3.0
+        bot.md.update(D("186.22"), D("186.24"), D("10.0"), D("10.0"), clock.t)
+        u_quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        sells = [q for q in u_quotes if q.side == SELL]
+        self.assertGreaterEqual(len(sells), 1)
+        self.assertFalse(sells[0].is_taker, "Must NOT fire taker IOC on a 3s wick!")
+        self.assertGreaterEqual(sells[0].price, D("186.44"), "Must hold breakeven 186.44 during a 3s wick instead of dumping at 186.24!")
+
+        # 3. Verify learner persistent toxicity floor after >=10 markouts with high adverse fill rate
+        l = bot.ledger.learner
+        for _ in range(12):
+            l.on_markout(D("-3.0"), BUY, D("3.0"), horizon=5.0, now=clock.t)
+        clock.t += 120.0
+        l.tick_decay(clock.t)
+        self.assertGreater(l.min_edge_bps, D("3.5"), "Learner must retain elevated min_edge_bps floor when adverse_fill_rate > 55%!")
+        self.assertGreater(l.skew_bps, bot.cfg.skew_bps, "Learner must retain elevated skew_bps floor when adverse_fill_rate > 55%!")
+        print("✓ test_11_nbis_log_regression_strict_edge_and_no_wick_stop passed: NBIS-USD regression fixes verified.")
+
+
+    async def test_12_dry_run_paper_simulator_fills_and_rolling_learner(self):
+        """12. DRY_RUN Paper Simulator Fills & Rolling Learner Win/Adverse Ratio Adaptation:
+        Verifies:
+        - When DRY_RUN=1, resting paper orders fill on live BBO crosses and queue-depleting trades,
+          and _reconcile() does not wipe out paper orders or simulated positions.
+        - OnlineLearner rolling win_rate / adverse_fill_rate adapts toward 50/50+ as benign markouts arrive,
+          even if historical lifetime n_toxic was high.
+        """
+        bot, s, clock = sim.make(DRY_RUN="1", ORDER_USD=35, MAX_POSITION_USD=105, EXTRA_LEVELS=0, MIN_EDGE_BPS="2.5")
+        m = sim.Market(46, "NBIS-USD", "ONLINE", D("0.01"), D("0.0001"), [], D("5"), D("0.0001"), D("100000"), D("186.50"), False)
+        bot.md.info = m
+        bot.md.update(D("186.49"), D("186.51"), D("5.0"), D("5.0"), clock.t)
+        await bot.tick()
+        self.assertGreater(len(bot.om.orders), 0, "DRY_RUN must place paper orders")
+
+        # Verify _reconcile in DRY_RUN=1 does NOT drop paper orders
+        clock.t += 10.0
+        await bot._reconcile(clock.t)
+        self.assertGreater(len(bot.om.orders), 0, "DRY_RUN _reconcile must NOT drop paper orders!")
+
+        # Simulate a trade hitting our paper bid
+        b_ord = bot.om.get_order_by_slot(0, BUY)
+        self.assertIsNotNone(b_ord)
+        bot._on_channel("trades", {"side": "SELL", "quantity": "10.0", "price": str(b_ord.price)}, False)
+        self.assertGreater(bot.ledger.n_fills, 0, "DRY_RUN trade matching must record fill!")
+        self.assertGreater(bot.ledger.position, D(0), "DRY_RUN position must increase on BUY fill!")
+
+        # Verify rolling win_rate / adverse_fill_rate drifts upward when calibrated fills are benign
+        l = bot.ledger.learner
+        l.n_toxic = 150
+        l.n_benign = 50
+        for _ in range(10):
+            l.on_markout(D("1.2"), BUY, D("0.5"), horizon=5.0, now=clock.t)
+        self.assertGreaterEqual(l.win_rate, 60.0, "Rolling win_rate must adapt upward when recent markouts improve!")
+        print("✓ test_12_dry_run_paper_simulator_fills_and_rolling_learner passed: Paper simulator fills and rolling learner verified.")
+
+
 if __name__ == "__main__":
     unittest.main()

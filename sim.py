@@ -235,3 +235,118 @@ async def step(bot, sim, clock, bid, ask, bsz="1", asz="1", dt=0.25, tick=True, 
         await bot.tick()
     for _ in range(3):
         await asyncio.sleep(0)
+
+
+async def run_standalone_sim(steps: int = 300, market_name: str = "NBIS-USD", base_px: float = 186.50) -> dict:
+    """Runs an interactive multi-regime simulation of the full MarketMaker bot with live fills and learner updates."""
+    import random, math, logging
+    from utils import setup_logging, BUY, SELL
+    setup_logging(os.getenv("LOG_LEVEL", "INFO"))
+    rng = random.Random(42)
+
+    bot, s, clock = make(
+        MARKET=market_name,
+        ORDER_USD=os.getenv("ORDER_USD", "35"),
+        MAX_POSITION_USD=os.getenv("MAX_POSITION_USD", "105"),
+        EXTRA_LEVELS=os.getenv("EXTRA_LEVELS", "2"),
+        MIN_EDGE_BPS=os.getenv("MIN_EDGE_BPS", "2.8"),
+        LEVEL_SPACING_BPS=os.getenv("LEVEL_SPACING_BPS", "3.0"),
+        SKEW_BPS=os.getenv("SKEW_BPS", "5.5"),
+        MIN_EV_BPS=os.getenv("MIN_EV_BPS", "0.35"),
+        MAKER_EXIT_FIRST=os.getenv("MAKER_EXIT_FIRST", "1"),
+        ENABLE_TAKER_EXITS=os.getenv("ENABLE_TAKER_EXITS", "0"),
+        ENABLE_SELECTIVE_TOUCH=os.getenv("ENABLE_SELECTIVE_TOUCH", "0"),
+        STATUS_S="5.0",
+    )
+    tick = D("0.01") if base_px < 5000 else D("0.1")
+    step_sz = D("0.0001")
+    m = Market(46, market_name, "ONLINE", tick, step_sz, [], D("5"), step_sz, D("100000"), D(str(base_px)), False)
+    bot.md.info = m
+    s.mkt_id = m.market_id
+
+    mid = base_px
+    anchor = base_px
+    for i in range(steps):
+        # Mean-reverting Ornstein-Uhlenbeck process + occasional micro-bursts
+        regime_phase = (i // 60) % 3
+        vol = 0.04 if regime_phase != 1 else 0.09
+        drift = -0.18 * (mid - anchor) + rng.gauss(0.0, vol)
+        mid = max(1.0, round(mid + drift, 2 if tick == D("0.01") else 1))
+        half_spr = float(tick) if rng.random() < 0.7 else float(tick) * 2.0
+        bid_f = round(mid - half_spr, 2 if tick == D("0.01") else 1)
+        ask_f = round(mid + half_spr, 2 if tick == D("0.01") else 1)
+        if ask_f <= bid_f:
+            ask_f = round(bid_f + float(tick) * 2.0, 2 if tick == D("0.01") else 1)
+
+        bsz = f"{rng.uniform(3.0, 18.0):.2f}"
+        asz = f"{rng.uniform(3.0, 18.0):.2f}"
+        m.mark = D(str(round((bid_f + ask_f) * 0.5, 3)))
+
+        # Push realistic L2 depth & trade prints
+        bids_l2 = [[str(round(bid_f - k * float(tick), 2)), f"{rng.uniform(4.0, 20.0):.2f}"] for k in range(8)]
+        asks_l2 = [[str(round(ask_f + k * float(tick), 2)), f"{rng.uniform(4.0, 20.0):.2f}"] for k in range(8)]
+        bot.md.on_depth(bids_l2, asks_l2, clock.t)
+
+        t_side = BUY if rng.random() < 0.5 else SELL
+        t_px = ask_f if t_side == BUY else bid_f
+        s.push_trade(t_side, f"{rng.uniform(0.2, 2.5):.3f}", str(t_px))
+
+        await step(bot, s, clock, str(bid_f), str(ask_f), bsz=bsz, asz=asz, dt=0.5)
+
+        # Simulate marketable retail/informed order flow hitting our quotes when competitive
+        if s.orders and rng.random() < 0.45:
+            hit_side = BUY if rng.random() < 0.5 else SELL
+            cands = [o for o in s.orders.values() if o["side"] != hit_side]
+            if cands:
+                # Prefer filling closest order to mid
+                cands.sort(key=lambda o: abs(float(o["price"]) - mid))
+                best_o = cands[0]
+                dist_bps = abs(float(best_o["price"]) - mid) / mid * 10000.0
+                if rng.random() < math.exp(-0.22 * max(0.0, dist_bps - 1.0)):
+                    q = best_o["rem"]
+                    signed = q if best_o["side"] == "BUY" else -q
+                    s.position += signed
+                    s.cash -= signed * best_o["price"]
+                    s.orders.pop(best_o["id"], None)
+                    best_o["rem"] = D(0)
+                    s._push(best_o, "FILLED", "FILLED", rem=D(0))
+                    for _ in range(3):
+                        await asyncio.sleep(0)
+
+        bot._status_log(clock.t)
+
+    summary = bot.ledger.learner.get_summary()
+    final_mid = bot.md.mid or D(str(mid))
+    res = {
+        "market": market_name,
+        "steps": steps,
+        "fills": bot.ledger.n_fills,
+        "buys": bot.ledger.n_buys,
+        "sells": bot.ledger.n_sells,
+        "volume_usd": float(bot.ledger.volume_usd),
+        "spread_capture_usd": float(bot.ledger.spread_capture),
+        "avg_edge_bps": float(bot.ledger.avg_edge_bps),
+        "realized_pnl_usd": float(bot.ledger.realized),
+        "total_pnl_usd": float(bot.ledger.total_pnl(final_mid)),
+        "win_rate_pct": summary["win_rate"],
+        "adverse_fill_rate_pct": summary["adverse_fill_rate"],
+        "learner_updates": summary["total_updates"],
+    }
+    print("\n" + "=" * 72)
+    print(f"SIMULATION COMPLETE | Market: {res['market']} | Steps: {res['steps']}")
+    print(f"Fills: {res['fills']} ({res['buys']}B / {res['sells']}S) | Volume: ${res['volume_usd']:,.2f}")
+    print(f"Spread Capture: ${res['spread_capture_usd']:+.4f} (avg {res['avg_edge_bps']:.2f} bps)")
+    print(f"Realized PnL:   ${res['realized_pnl_usd']:+.4f} | Total PnL: ${res['total_pnl_usd']:+.4f}")
+    print(f"Learner Updates: {res['learner_updates']} | Calibrated Win Rate: {res['win_rate_pct']:.1f}% | Adverse Rate: {res['adverse_fill_rate_pct']:.1f}%")
+    print("=" * 72)
+    return res
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Run standalone Arcus MM simulation")
+    ap.add_argument("--steps", type=int, default=300, help="Number of simulation steps")
+    ap.add_argument("--market", default=os.getenv("MARKET", "NBIS-USD"), help="Market symbol")
+    ap.add_argument("--price", type=float, default=186.50, help="Initial mid price")
+    args = ap.parse_args()
+    asyncio.run(run_standalone_sim(steps=args.steps, market_name=args.market, base_px=args.price))

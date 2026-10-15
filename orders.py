@@ -37,6 +37,8 @@ class Order:
     ev_bps: Decimal = Decimal(0)
     quote_mid: Optional[Decimal] = None
     est_px: Optional[Decimal] = None
+    queue_ahead: Decimal = Decimal(0)
+    cum_filled: Decimal = Decimal(0)
 
 
 class OrderManager:
@@ -162,8 +164,15 @@ class OrderManager:
         self._reject_n[side] = 0
         self.n_place += 1
         oid = str(res["orderId"])
+        q_ahead = ZERO
+        if self.cfg.dry_run and not is_taker and self.md is not None and hasattr(self.md, "queue_ahead"):
+            try:
+                q_ahead = max(ZERO, self.md.queue_ahead(side, px) * Decimal("0.25"))
+            except Exception:
+                q_ahead = ZERO
         o = Order(oid, pair_index, side, px, qty, qty, good_til, now, now,
-                  is_taker=is_taker, is_reduce_only=reduce_only, quote_mid=quote_mid, est_px=est_px)
+                  is_taker=is_taker, is_reduce_only=reduce_only, quote_mid=quote_mid, est_px=est_px,
+                  queue_ahead=q_ahead)
         self.orders[oid] = o
         if not is_taker:
             self.pair_slots[(pair_index, side)] = oid
@@ -171,6 +180,13 @@ class OrderManager:
         early = self._unmatched.pop(oid, None)
         if early:
             self._apply(o, early[1], now)
+        if self.cfg.dry_run and is_taker:
+            fill_px = est_px or ((self.md.ask if side == BUY else self.md.bid) if self.md else None) or px
+            self._apply(o, {
+                "orderId": oid, "state": "FILLED", "status": "FILLED",
+                "price": str(px), "avgFillPrice": str(fill_px),
+                "filledSize": str(qty), "remainingSize": "0"
+            }, now)
         return o
 
     async def modify(self, o: Order, px: Decimal, now: float, urgent: bool = False,
@@ -204,6 +220,11 @@ class OrderManager:
         self._consec_errors = 0
         self.n_modify += 1
         log.info("MODIFY L%d %s %s -> %s (reduce_only=%s)", o.pair_index, o.side, fmt(o.price), fmt(px), r_only)
+        if self.cfg.dry_run and px != o.price and self.md is not None and hasattr(self.md, "queue_ahead"):
+            try:
+                o.queue_ahead = max(ZERO, self.md.queue_ahead(o.side, px) * Decimal("0.25"))
+            except Exception:
+                o.queue_ahead = ZERO
         o.price, o.last_action, o.is_reduce_only = px, now, r_only
         return True
 
@@ -321,6 +342,7 @@ class OrderManager:
             if ledger is not None:
                 if (t.side == SELL and ledger.position <= ZERO) or (t.side == BUY and ledger.position >= ZERO):
                     taker_r_only = False
+            self.reject_until[t.side] = max(self.reject_until[t.side], now + 0.50)
             await self.place(t.pair_index, t.side, t.price, t.qty, now,
                              time_in_force="IOC", reduce_only=taker_r_only,
                              quote_mid=getattr(t, "quote_mid", None),
@@ -388,7 +410,7 @@ class OrderManager:
         min_requote_delay = getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s
 
         # Don't modify on sub-tick or 1-tick jiggles unless drift exceeds threshold or min delay passed
-        if is_retreating and (drift >= eff_retreat):
+        if is_retreating and (drift >= eff_retreat) and (is_exit or time_since_last >= 0.25 or drift >= eff_retreat * Decimal("2.5")):
             should_modify = True
             urgent = True
         elif is_advancing and (drift >= eff_requote) and (time_since_last >= min_requote_delay):
@@ -515,6 +537,8 @@ class OrderManager:
                     self.reject_until[o.side] = max(self.reject_until[o.side], now + 0.15)
                 else:
                     self._backoff(o.side, now)
+            if not o.is_taker and (now - o.last_action < 1.0):
+                self.reject_until[o.side] = max(self.reject_until[o.side], now + 0.25)
             log.info("ORDER L%d %s %s %s", o.pair_index, o.side, state or status, reason)
             self._remove_order(o.order_id)
 
@@ -549,3 +573,74 @@ class OrderManager:
                 log.warning("cancelling orphan order %s for market %s (id %d)", oid, m.name, m.market_id)
                 reqs.append(self.ex.write(self.signer.cancel(m, oid)))
         await self._gather(reqs)
+
+
+    def on_dry_bbo(self, bid: Decimal, ask: Decimal, now: float) -> None:
+        """Simulates fills in DRY_RUN=1 when live BBO crosses or touches our resting paper orders."""
+        if not self.cfg.dry_run or not self.orders:
+            return
+        for o in list(self.orders.values()):
+            if o.is_taker or o.cancelling_since is not None or o.remaining <= ZERO:
+                continue
+            if (o.side == BUY and ask <= o.price) or (o.side == SELL and bid >= o.price):
+                new_cum = o.qty
+                self._apply(o, {
+                    "orderId": o.order_id, "state": "FILLED", "status": "FILLED",
+                    "price": str(o.price), "avgFillPrice": str(o.price),
+                    "filledSize": str(new_cum), "remainingSize": "0"
+                }, now)
+
+    def on_dry_trade(self, trade_side: str, trade_sz: Decimal, trade_px: Decimal, now: float) -> None:
+        """Simulates queue-aware fills in DRY_RUN=1 when live market trades hit or cross our paper orders."""
+        if not self.cfg.dry_run or not self.orders or trade_sz <= ZERO:
+            return
+        rem_flow = trade_sz
+        t_side = trade_side.upper()
+        # Sort resting orders by price priority
+        candidates = sorted(
+            [o for o in self.orders.values() if not o.is_taker and o.cancelling_since is None and o.remaining > ZERO],
+            key=lambda x: x.price if x.side == SELL else -x.price
+        )
+        for o in candidates:
+            if rem_flow <= ZERO:
+                break
+            if o.side == BUY:
+                # Trade printed at or below our bid price
+                if trade_px < o.price or (trade_px == o.price and t_side in ("SELL", "ASK")):
+                    if trade_px < o.price:
+                        o.queue_ahead = ZERO
+                    elif o.queue_ahead > ZERO:
+                        deplete = min(o.queue_ahead, rem_flow)
+                        o.queue_ahead -= deplete
+                        rem_flow -= deplete
+                    if rem_flow > ZERO and o.queue_ahead <= ZERO:
+                        fill_sz = min(o.remaining, rem_flow)
+                        rem_flow -= fill_sz
+                        new_cum = getattr(o, "cum_filled", ZERO) + fill_sz
+                        new_rem = max(ZERO, o.qty - new_cum)
+                        st = "FILLED" if new_rem <= ZERO else "PARTIALLY_FILLED"
+                        self._apply(o, {
+                            "orderId": o.order_id, "state": st, "status": st,
+                            "price": str(o.price), "avgFillPrice": str(o.price),
+                            "filledSize": str(new_cum), "remainingSize": str(new_rem)
+                        }, now)
+            else:
+                # Trade printed at or above our ask price
+                if trade_px > o.price or (trade_px == o.price and t_side in ("BUY", "BID")):
+                    if trade_px > o.price:
+                        o.queue_ahead = ZERO
+                    elif o.queue_ahead > ZERO:
+                        deplete = min(o.queue_ahead, rem_flow)
+                        o.queue_ahead -= deplete
+                        rem_flow -= deplete
+                    if rem_flow > ZERO and o.queue_ahead <= ZERO:
+                        fill_sz = min(o.remaining, rem_flow)
+                        rem_flow -= fill_sz
+                        new_cum = getattr(o, "cum_filled", ZERO) + fill_sz
+                        new_rem = max(ZERO, o.qty - new_cum)
+                        st = "FILLED" if new_rem <= ZERO else "PARTIALLY_FILLED"
+                        self._apply(o, {
+                            "orderId": o.order_id, "state": st, "status": st,
+                            "price": str(o.price), "avgFillPrice": str(o.price),
+                            "filledSize": str(new_cum), "remainingSize": str(new_rem)
+                        }, now)
