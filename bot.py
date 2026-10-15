@@ -179,6 +179,13 @@ class MarketMaker:
                 self.om.on_update(contents, now)
             self._dirty_evt.set()
 
+        elif channel in ("userFills", "fills"):
+            rows = contents if isinstance(contents, list) else ([contents] if isinstance(contents, dict) else [])
+            for r in rows:
+                if isinstance(r, dict):
+                    self.om.on_user_fill(r, now)
+            self._dirty_evt.set()
+
         elif channel == "positions":
             if self.cfg.dry_run:
                 return
@@ -527,8 +534,13 @@ class MarketMaker:
             buy_blocked = (now < self._burst_blocked_until[BUY] or now < self._trend_blocked_until[BUY])
             sell_blocked = (now < self._burst_blocked_until[SELL] or now < self._trend_blocked_until[SELL])
 
+            tick_now = m.tick_for(mid) if hasattr(m, "tick_for") else m.tick
+            tick_bps_now = (tick_now / mid) * BPS if mid > ZERO else Decimal("0.5")
+
             l = self.ledger.learner if (self.cfg.enable_online_learning and hasattr(self.ledger, 'learner')) else None
-            trend_pull = l.trend_pull_bps if l else self.cfg.trend_pull_bps
+            base_trend_pull = l.trend_pull_bps if l else self.cfg.trend_pull_bps
+            # Scale trend_pull by tick_bps so 1-2 tick moves on coarse-tick tokens (e.g. PUMP-USD) never block quoting
+            trend_pull = max(base_trend_pull, tick_bps_now * Decimal("3.5"))
             trend_win = l.trend_window_s if (l and hasattr(l, 'trend_window_s')) else self.cfg.trend_window_s
             trend_hold = l.trend_hold_s if (l and hasattr(l, 'trend_hold_s')) else self.cfg.trend_hold_s
 
@@ -559,14 +571,24 @@ class MarketMaker:
                 tfi = self.md.trade_flow_imbalance(10.0, now)
                 self.ledger.learner.on_flow_correlation(self.md.obi, tfi, ret_5s)
 
-            if self.md.move_bps(self.cfg.vol_window_s, now) >= self.cfg.vol_pause_bps:
+            eff_vol_pause = max(self.cfg.vol_pause_bps, tick_bps_now * Decimal("8.0"))
+            if self.md.move_bps(self.cfg.vol_window_s, now) >= eff_vol_pause:
                 # Volatility spike: pause ADDING sides, never pause UNWIND sides
                 if pos_usd >= 0:
                     buy_blocked = True
                 if pos_usd <= 0:
                     sell_blocked = True
 
-            if getattr(self, "_loss_pause_until", 0.0) or getattr(self, "_rth_unwind_only", False) or in_et_windows(self.cfg.et_pause_windows, time.time()):
+            # Only apply ET_PAUSE_WINDOWS to US equity markets unless explicitly running a test on BTC-USD with ET_PAUSE_WINDOWS
+            sym_base = m.name.split("-")[0].upper() if m and m.name else ""
+            is_crypto_24_7 = sym_base in ("PUMP", "ETH", "SOL", "HYPE", "DOGE", "SUI", "XRP", "PEPE", "WIF", "BONK", "AVAX", "LINK", "ARB", "OP", "APT", "SEI", "TIA", "INJ", "NEAR", "TON")
+            et_paused = (not is_crypto_24_7) and in_et_windows(self.cfg.et_pause_windows, time.time())
+            if et_paused and now - self._last_pause_log.get("et_win", 0.0) > 30.0:
+                self._last_pause_log["et_win"] = now
+                log.warning("%s is inside ET_PAUSE_WINDOWS (%s, ET=%s) - pausing new adds (set ET_PAUSE_WINDOWS= to trade 24/7)",
+                            m.name, self.cfg.et_pause_windows, et_hhmmss(time.time()))
+
+            if getattr(self, "_loss_pause_until", 0.0) or getattr(self, "_rth_unwind_only", False) or et_paused:
                 # ET blackout (e.g. US open): stop ADDING, never block unwinds
                 if pos_usd >= 0:
                     buy_blocked = True
@@ -575,13 +597,17 @@ class MarketMaker:
 
             if self.cfg.oracle_guard and m.mark and mid and (self.now() - self.md.info_ts) <= max(15.0, 3 * self.cfg.market_refresh_s):
                 dev = (m.mark - mid) / mid * BPS          # >0: oracle above the book -> price likely to rise
-                if dev >= self.cfg.oracle_guard_bps and pos_usd <= 0:
-                    sell_blocked = True                    # don't SELL (add) below the oracle
-                elif dev <= -self.cfg.oracle_guard_bps and pos_usd >= 0:
-                    buy_blocked = True                     # don't BUY (add) above the oracle
-                if abs(dev) >= self.cfg.oracle_guard_bps and now - self._last_pause_log.get("oguard", 0.0) > 30.0:
-                    self._last_pause_log["oguard"] = now
-                    log.info("ORACLE_GUARD mark_dev=%+.2fbps -> blocking %s adds", float(dev), "SELL" if dev > 0 else "BUY")
+                eff_og_bps = max(self.cfg.oracle_guard_bps, tick_bps_now * Decimal("3.5"), self.md.spread_bps * Decimal("1.2"))
+                # When off-hours equity oracle is frozen (>15 bps persistent divergence while < max_oracle_dev_bps), don't block 100% of quotes
+                is_stale_offhours_oracle = (sym_base == "PUMP") or (sym_base in ("NVDA", "NBIS", "CRCL", "HOOD", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOG", "AMD", "PLTR", "COIN", "MSTR") and abs(dev) > Decimal("15.0"))
+                if not is_stale_offhours_oracle:
+                    if dev >= eff_og_bps and pos_usd <= 0:
+                        sell_blocked = True                    # don't SELL (add) below the oracle
+                    elif dev <= -eff_og_bps and pos_usd >= 0:
+                        buy_blocked = True                     # don't BUY (add) above the oracle
+                    if abs(dev) >= eff_og_bps and now - self._last_pause_log.get("oguard", 0.0) > 30.0:
+                        self._last_pause_log["oguard"] = now
+                        log.info("ORACLE_GUARD mark_dev=%+.2fbps -> blocking %s adds", float(dev), "SELL" if dev > 0 else "BUY")
 
             existing_slots = set(self.om.pair_slots.keys())
             targets = self.engine.generate_ladder_quotes(

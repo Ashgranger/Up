@@ -475,7 +475,9 @@ class MarketData:
         self._move_cache.clear()
         mid = self.mid
         if prev and mid and bid < ask:
-            if abs(mid - prev) / prev * BPS >= self.cfg.jump_bps:
+            tick_bps = (self.info.tick_for(mid) / mid * BPS) if (self.info and mid > 0) else Decimal("0.5")
+            eff_jump_bps = max(self.cfg.jump_bps, tick_bps * Decimal("6.0"))
+            if abs(mid - prev) / prev * BPS >= eff_jump_bps:
                 self.jump_until = now + self.cfg.jump_cooldown_s
         if bid < ask and self.cross.venues:
             self.cross.observe_local(mid, now)

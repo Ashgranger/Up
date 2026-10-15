@@ -39,6 +39,7 @@ class Order:
     est_px: Optional[Decimal] = None
     queue_ahead: Decimal = Decimal(0)
     cum_filled: Decimal = Decimal(0)
+    prev_price: Optional[Decimal] = None
 
 
 class OrderManager:
@@ -225,6 +226,8 @@ class OrderManager:
                 o.queue_ahead = max(ZERO, self.md.queue_ahead(o.side, px) * Decimal("0.25"))
             except Exception:
                 o.queue_ahead = ZERO
+        if px != o.price:
+            o.prev_price = o.price
         o.price, o.last_action, o.is_reduce_only = px, now, r_only
         return True
 
@@ -450,15 +453,25 @@ class OrderManager:
         status = str(c.get("status") or "").upper()
         filled = (state == "FILLED" or status == "FILLED")
         px = o.price
+        has_exec_px = False
         try:
             if c.get("price"):
                 px = Decimal(str(c["price"]))
-            # takers: record the real execution price when the exchange reports it, not our limit
-            for k in ("avgPrice", "averagePrice", "avgFillPrice", "lastFillPrice", "fillPrice"):
+            for k in ("avgPrice", "averagePrice", "avgFillPrice", "lastFillPrice", "fillPrice", "matchedPrice", "execPrice"):
                 v = c.get(k)
                 if v and Decimal(str(v)) > 0:
                     px = Decimal(str(v))
+                    has_exec_px = True
                     break
+            # Guard against modify-race where an order filled at prev_price right as a retreating modify updated o.price
+            if (not has_exec_px) and (not o.is_taker) and getattr(o, "prev_price", None) is not None and (now - o.last_action < 8.0):
+                if self.md is not None and self.md.bid and self.md.ask:
+                    m = self.get_market()
+                    tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
+                    if o.side == BUY and px < self.md.bid - Decimal("2") * tick and o.prev_price >= self.md.bid - Decimal("2") * tick:
+                        px = o.prev_price
+                    elif o.side == SELL and px > self.md.ask + Decimal("2") * tick and o.prev_price <= self.md.ask + Decimal("2") * tick:
+                        px = o.prev_price
         except Exception:
             pass
         if o.is_taker and (filled or state == "PARTIALLY_FILLED"):
@@ -506,6 +519,9 @@ class OrderManager:
 
         if fill_qty > 0:
             o.filled_any = True
+            if not hasattr(self, "_recent_filled_orders"):
+                self._recent_filled_orders = {}
+            self._recent_filled_orders[o.order_id] = (now, o.side, fill_qty, px, getattr(o, "is_reduce_only", False))
             self.on_fill(o.side, fill_qty, px, o)
         if state == "OPEN" or status == "OPEN":
             self._reject_n[o.side] = 0
@@ -644,3 +660,54 @@ class OrderManager:
                             "price": str(o.price), "avgFillPrice": str(o.price),
                             "filledSize": str(new_cum), "remainingSize": str(new_rem)
                         }, now)
+
+
+    def on_user_fill(self, c: dict, now: float) -> None:
+        """Reconciles exact execution price and exchange fee from the userFills channel."""
+        if not isinstance(c, dict):
+            return
+        oid = str(c.get("orderId") or c.get("id") or "")
+        if not oid:
+            return
+        # Extract true execution price and fee from userFills payload
+        exec_px = None
+        for k in ("price", "fillPrice", "avgFillPrice", "avgPrice", "matchedPrice", "execPrice"):
+            v = c.get(k)
+            if v is not None:
+                try:
+                    d = Decimal(str(v))
+                    if d > ZERO:
+                        exec_px = d
+                        break
+                except Exception:
+                    pass
+        fee_usd = None
+        for fk in ("fee", "commission", "feeUsd", "makerFee", "takerFee"):
+            fv = c.get(fk)
+            if fv is not None:
+                try:
+                    fee_usd = Decimal(str(fv))
+                    break
+                except Exception:
+                    pass
+
+        # If order is still open in self.orders and hasn't processed FILLED yet, update its price
+        o = self.orders.get(oid)
+        if o is not None and exec_px is not None:
+            o.price = exec_px
+
+        # If order was already booked via 'orders' channel at a stale limit price, adjust ledger realized PnL
+        rec_map = getattr(self, "_recent_filled_orders", None)
+        if rec_map and oid in rec_map and self.ledger is not None:
+            f_ts, f_side, f_qty, booked_px, _ = rec_map[oid]
+            if exec_px is not None and abs(exec_px - booked_px) > Decimal("1e-9"):
+                # Adjust realized or avg_cost for the difference between true exec_px and booked_px
+                px_diff = ( booked_px - exec_px ) if f_side == BUY else ( exec_px - booked_px )
+                pnl_adj = px_diff * f_qty
+                self.ledger.realized += pnl_adj
+                rec_map[oid] = (f_ts, f_side, f_qty, exec_px, _)
+                log.info("USER_FILL_SYNC order=%s adjusted fill_px %s -> %s (pnl_adj=$%s, total_realized=$%s)",
+                         oid, fmt(booked_px), fmt(exec_px), fmt(pnl_adj), fmt(self.ledger.realized))
+            if fee_usd is not None and fee_usd != ZERO:
+                self.ledger.fees += fee_usd
+                self.ledger.realized -= fee_usd

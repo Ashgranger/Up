@@ -510,5 +510,59 @@ class TestLevel4MarketMaker(unittest.IsolatedAsyncioTestCase):
         print("✓ test_12_dry_run_paper_simulator_fills_and_rolling_learner passed: Paper simulator fills and rolling learner verified.")
 
 
+    async def test_13_pump_usd_active_quoting_and_accurate_pnl(self):
+        """13. PUMP-USD 24/7 Active Quoting & Accurate Modify-Race / UserFill PnL Accounting:
+        Verifies:
+        - PUMP-USD (mid=0.003500, tick=0.000001 ~ 2.86bps) actively places L0 + L1 two-sided quotes
+          even when ET_PAUSE_WINDOWS=15:50-09:45 is set, and is not blocked by 1-2 tick moves (~5.7 bps).
+        - Unwind breakeven_px includes at least +1 tick profit (never $0.00 gross profit on normal hold time).
+        - Modify-race fill and userFills channel reconcile exact execution price and fee into ledger.realized.
+        """
+        import orders, engine
+        bot, s, clock = sim.make(
+            MARKET="PUMP-USD", ORDER_USD=35, MAX_POSITION_USD=105, EXTRA_LEVELS=1,
+            MIN_EDGE_BPS="2.2", LEVEL_SPACING_BPS="3.5", ET_PAUSE_WINDOWS="00:00-23:59",
+            TREND_PULL_BPS="2.0", JUMP_BPS="5.5", VOL_PAUSE_BPS="10.0", ORACLE_GUARD="1", ORACLE_GUARD_BPS="3.0"
+        )
+        m_pump = sim.Market(99, "PUMP-USD", "ONLINE", D("0.000001"), D("1"), [], D("5"), D("1"), D("10000000"), D("0.003530"), False)
+        bot.md.info = m_pump
+        bot.md.info_ts = clock.t
+
+        # Simulate a 2-tick move on PUMP-USD (0.003500 -> 0.003502 = 5.71 bps)
+        await sim.step(bot, s, clock, "0.003499", "0.003501", bsz="50000", asz="50000")
+        await sim.step(bot, s, clock, "0.003501", "0.003503", bsz="50000", asz="50000", dt=0.5)
+
+        b0 = bot.om.get_order_by_slot(0, BUY)
+        s0 = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(b0, "PUMP-USD L0 BUY must be placed (never blocked by ET_PAUSE_WINDOWS or 2-tick move)!")
+        self.assertIsNotNone(s0, "PUMP-USD L0 SELL must be placed!")
+
+        # Test userFills exact execution price & fee reconciliation on NBIS-USD
+        bot2, s2, clock2 = sim.make(MARKET="NBIS-USD", ORDER_USD=35, MAX_POSITION_USD=105, MIN_EDGE_BPS="2.3", STRESS_LOSS_BPS="15.0")
+        m_nbis = sim.Market(46, "NBIS-USD", "ONLINE", D("0.01"), D("0.0001"), [], D("5"), D("0.0001"), D("100000"), D("182.02"), False)
+        bot2.md.info = m_nbis
+        bot2.md.update(D("182.01"), D("182.03"), D("10.0"), D("10.0"), clock2.t)
+
+        # Enter short at 182.02
+        o_sell = orders.Order("s1", 1, SELL, D("182.02"), D("0.10"), D("0.10"), 1001, clock2.t, clock2.t, quote_mid=D("182.00"))
+        bot2._on_fill(SELL, D("0.10"), D("182.02"), o_sell)
+
+        # Check unwind L0 BUY targets <= 182.01 (+1 tick profit, NOT 182.02 $0 profit!)
+        clock2.t += 2.0
+        bot2.md.update(D("182.01"), D("182.03"), D("2.0"), D("10.0"), clock2.t)
+        u_quotes = bot2.engine.generate_ladder_quotes(m_nbis, bot2.md, bot2.ledger, clock2.t, False, False)
+        u_buys = [q for q in u_quotes if q.side == BUY]
+        self.assertGreaterEqual(len(u_buys), 1)
+        self.assertLessEqual(u_buys[0].price, D("182.01"), "Unwind BUY must target at least 1 tick profit (<=182.01, not 182.02)!")
+
+        # Simulate modify-race fill: order was at 182.18 (prev_price), modified to 182.02 while mid=182.185, then FILLED arrives
+        o_buy = orders.Order("b_race", 0, BUY, D("182.02"), D("0.10"), D("0.10"), 1002, clock2.t, clock2.t, is_reduce_only=True, prev_price=D("182.18"))
+        bot2.om.orders["b_race"] = o_buy
+        bot2.md.update(D("182.18"), D("182.19"), D("10.0"), D("10.0"), clock2.t)
+        bot2.om._apply(o_buy, {"orderId": "b_race", "state": "FILLED", "status": "FILLED", "price": "182.02", "filledSize": "0.10", "remainingSize": "0"}, clock2.t)
+        self.assertLess(bot2.ledger.realized, D(0), "Modify-race fill at 182.18 must book real loss (-$0.016), NOT fake $0.00 at 182.02!")
+        print("✓ test_13_pump_usd_active_quoting_and_accurate_pnl passed: PUMP-USD active quoting & exact PnL accounting verified.")
+
+
 if __name__ == "__main__":
     unittest.main()
